@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocish"
+version = "0.1.0"
+description = "A virtual Plan 9-style OCI namespace shell"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["oci>=2.184.1", "openai>=2.0", "httpx>=0.28", "oci-genai-auth>=0.1"]
+
+[project.scripts]
+ocish = "main:main"
+
+[tool.setuptools]
+packages = ["ocish"]
+py-modules = [
+    "completion",
+    "config",
+    "config_data",
+    "deletion",
+    "genai_data",
+    "inventory",
+    "main",
+    "models",
+    "relationships",
+    "rendering",
+]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "PIE", "FURB", "RUF"]
+ignore = ["E501", "EXE001"]
