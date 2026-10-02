@@ -35,6 +35,7 @@ class ActiveRegionCatalog:
         self._thread: threading.Thread | None = None
         self._index_lock = threading.Lock()
         self._scanned_compartments: set[str] = set()
+        self._requested_compartment: str | None = None
         self._region: str | None = None
         self._snapshot: dict[tuple[str, str], tuple[str, ...]] = {}
         self._id_snapshot: dict[tuple[str, str], tuple[str, ...]] = {}
@@ -45,6 +46,8 @@ class ActiveRegionCatalog:
 
     def start(self) -> None:
         if self._thread is None:
+            with self._lock:
+                self._requested_compartment = self.browser.current.id
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
 
@@ -52,6 +55,12 @@ class ActiveRegionCatalog:
         self._wake.set()
 
     def refresh_soon(self) -> None:
+        self._wake.set()
+
+    def request_compartment(self, compartment_id: str) -> None:
+        """Refresh completion inventory for the active compartment in the worker."""
+        with self._lock:
+            self._requested_compartment = compartment_id
         self._wake.set()
 
     def names_for(self, compartment_id: str, spec: ResourceSpec) -> tuple[str, ...]:
@@ -120,6 +129,9 @@ class ActiveRegionCatalog:
                     self._collections_snapshot = {}
                     self._refreshed_at = time.monotonic()
                     self._scanned_compartments = set()
+                    compartment_id = self._requested_compartment
+                if compartment_id is not None:
+                    self.prime_compartment(compartment_id)
             self._wake.wait(self.REFRESH_SECONDS)
             if self._wake.is_set():
                 self._wake.clear()
@@ -146,7 +158,7 @@ class ActiveRegionCatalog:
             self._refreshed_at = time.monotonic()
 
     def prime_compartment(self, compartment_id: str) -> None:
-        """Fetch one compartment's completion inventory on its first TAB."""
+        """Populate one compartment's completion inventory when explicitly scheduled."""
         with self._index_lock:
             with self._lock:
                 if (
@@ -261,6 +273,7 @@ class OciCompartmentBrowser:
         self.devops = oci.devops.DevopsClient(self.config)
         self.apm_domain = oci.apm_control_plane.ApmDomainClient(self.config)
         self.dns = oci.dns.DnsClient(self.config)
+        self.limits = oci.limits.LimitsClient(self.config)
         self.resource_manager = oci.resource_manager.ResourceManagerClient(self.config)
         self.resource_search = oci.resource_search.ResourceSearchClient(self.config)
 
@@ -1374,6 +1387,7 @@ class OciCompartmentBrowser:
             "oci.devops.DevopsClient": oci.devops.DevopsClient,
             "oci.dns.DnsClient": oci.dns.DnsClient,
             "oci.identity.IdentityClient": oci.identity.IdentityClient,
+            "oci.limits.LimitsClient": oci.limits.LimitsClient,
             "oci.resource_manager.ResourceManagerClient": oci.resource_manager.ResourceManagerClient,
         }
         endpoint_family = str(config["endpoint_family"])
@@ -2454,6 +2468,14 @@ class OciCompartmentBrowser:
             "ttl": lambda obj: self._format_number(getattr(obj, "ttl", None)),
             "rdata": lambda obj: getattr(obj, "rdata", None) or None,
             "scope": lambda obj: getattr(obj, "scope", None) or None,
+            "scope_type": lambda obj: getattr(obj, "scope_type", None) or None,
+            "value": lambda obj: self._format_number(getattr(obj, "value", None)),
+            "are_quotas_supported": lambda obj: self._format_boolish(
+                getattr(obj, "are_quotas_supported", None)
+            ),
+            "is_eligible_for_limit_increase": lambda obj: self._format_boolish(
+                getattr(obj, "is_eligible_for_limit_increase", None)
+            ),
             "zone_type": lambda obj: getattr(obj, "zone_type", None) or None,
             "domain_name": lambda obj: getattr(obj, "domain_name", None) or None,
             "template": lambda obj: getattr(obj, "template", None) or None,

@@ -4,7 +4,6 @@ from __future__ import annotations
 import cmd
 import json
 import re
-import readline
 import shlex
 import shutil
 import sys
@@ -13,6 +12,12 @@ from pathlib import Path
 from typing import ClassVar
 
 import oci
+import gnureadline as readline
+
+# cmd.Cmd imports ``readline`` lazily inside cmdloop.  Make that import resolve
+# to the same GNU Readline module configured by this shell, rather than macOS's
+# libedit-backed standard-library module.
+sys.modules["readline"] = readline
 
 from completion import CompletionEngine
 from config import (
@@ -346,6 +351,8 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             .replace("%", "")
         )
         readline.set_completer_delims(delimiters)
+        readline.parse_and_bind('"\\e.": yank-last-arg')
+        readline.parse_and_bind('"≥": yank-last-arg')
 
     def _build_resource_context_children(
         self,
@@ -408,6 +415,51 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         target = self._effective_region()
         if self.browser.region() != target:
             self.browser.set_region(target)
+
+    def _request_current_compartment_catalog(self) -> None:
+        """Schedule active-compartment completion data when a catalog is running."""
+        catalog = getattr(self, "catalog", None)
+        browser = getattr(self, "browser", None)
+        current = getattr(browser, "current", None)
+        if catalog is not None and current is not None:
+            catalog.request_compartment(current.id)
+
+    def _prime_current_compartment_completion(self) -> None:
+        """Populate the current-compartment cache before returning from ``cd``.
+
+        Completion itself remains read-only against local snapshots.  A catalog
+        refresh can lag behind navigation, so ``cd`` eagerly creates the same
+        per-compartment type cache that ``ll`` uses.
+        """
+        browser = getattr(self, "browser", None)
+        loader = getattr(browser, "list_current_compartment_resource_types", None)
+        if loader is not None:
+            try:
+                loader()
+            except Exception:
+                # Navigation must remain usable when inventory is unavailable.
+                pass
+        self._request_current_compartment_catalog()
+
+    def _known_compartment_collections(self, compartment_id: str) -> tuple[str, ...]:
+        """Return live collection types from the catalog, falling back to its cache."""
+        catalog = getattr(self, "catalog", None)
+        if catalog is not None and catalog.is_ready():
+            collections = catalog.collections_for(compartment_id)
+            if collections:
+                return collections
+        try:
+            cache_key = (self.browser.region(), compartment_id)
+        except AttributeError:
+            return ()
+        cached = getattr(self.browser, "compartment_resource_type_cache", {}).get(
+            cache_key
+        )
+        return (
+            tuple(spec.qualified_name for spec, _count in cached[1])
+            if cached is not None
+            else ()
+        )
 
     def _relative_browser_path(self) -> str:
         path = self.browser.get_path()
@@ -2774,23 +2826,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         """Complete only collections currently discoverable by ``ll``."""
         if not hasattr(self.browser, "current") or not hasattr(self.browser, "region"):
             return self._complete_qualified_resource(text)
-        catalog = getattr(self, "catalog", None)
-        if catalog is not None and catalog.is_ready():
-            catalog.prime_compartment(self.browser.current.id)
-            qualified_names = catalog.collections_for(self.browser.current.id)
-        else:
-            try:
-                cache_key = (self.browser.region(), self.browser.current.id)
-            except AttributeError:
-                return self._complete_qualified_resource(text)
-            cached = getattr(self.browser, "compartment_resource_type_cache", {}).get(
-                cache_key
-            )
-            qualified_names = (
-                tuple(spec.qualified_name for spec, _count in cached[1])
-                if cached is not None
-                else ()
-            )
+        qualified_names = self._known_compartment_collections(self.browser.current.id)
         entries: list[str] = []
         for qualified_name in qualified_names:
             try:
@@ -2802,6 +2838,9 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                 and self._resource_hierarchy.policy_for(spec).permits_flat_access
             ):
                 entries.append(spec.qualified_name.replace("_", "-"))
+        if "." not in text:
+            namespaces = {entry.partition(".")[0] + "." for entry in entries}
+            return sorted(entry for entry in namespaces if entry.startswith(text))
         return sorted(entry for entry in entries if entry.startswith(text))
 
     def _complete_core_resource(self, text: str) -> list[str]:
@@ -3057,17 +3096,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
 
         children = children_for(current.id)
         entries = {child.name for child in children}
-        if catalog_ready:
-            catalog.prime_compartment(current.id)
-            qualified_names = catalog.collections_for(current.id)
-        else:
-            resource_cache = getattr(
-                self.browser, "compartment_resource_type_cache", {}
-            ).get((region, current.id))
-            resource_types = resource_cache[1] if resource_cache is not None else ()
-            qualified_names = tuple(
-                spec.qualified_name for spec, _count in resource_types
-            )
+        qualified_names = self._known_compartment_collections(current.id)
         for qualified_name in qualified_names:
             try:
                 spec = self.browser.resolve_resource_spec(qualified_name)
@@ -3230,7 +3259,12 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
     def completedefault(
         self, text: str, line: str, begidx: int, endidx: int
     ) -> list[str]:
-        return self._completion_engine().path(text, line, begidx, endidx)
+        """Do not guess at free-form command arguments."""
+        return []
+
+    def _command_name_completions(self, text: str) -> list[str]:
+        """Return executable shell verbs, never resource namespace entries."""
+        return cmd.Cmd.completenames(self, text)
 
     def _completion_engine(self) -> CompletionEngine:
         engine = getattr(self, "completion", None)
@@ -3242,19 +3276,36 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
     def _complete_resource_argument(
         self, text: str, line: str, begidx: int, endidx: int
     ) -> list[str]:
-        return self._completion_engine().path(text, line, begidx, endidx)
+        return self._completion_engine().resource_path(text, line, begidx, endidx)
 
     def complete_ls(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
-        return self._completion_engine().path(text, line, begidx, endidx)
+        return self._complete_resource_argument(text, line, begidx, endidx)
 
     def complete_ll(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
-        return self._completion_engine().path(text, line, begidx, endidx)
+        return self._complete_resource_argument(text, line, begidx, endidx)
 
     def complete_cd(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
-        return self._completion_engine().path(text, line, begidx, endidx)
+        return self._complete_resource_argument(text, line, begidx, endidx)
 
     def complete_cat(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
-        return self._completion_engine().path(text, line, begidx, endidx)
+        return self._complete_resource_argument(text, line, begidx, endidx)
+
+    def complete_readlink(
+        self, text: str, line: str, begidx: int, endidx: int
+    ) -> list[str]:
+        return self._complete_resource_argument(text, line, begidx, endidx)
+
+    def complete_head(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return self._complete_resource_argument(text, line, begidx, endidx)
+
+    def complete_tail(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return self._complete_resource_argument(text, line, begidx, endidx)
+
+    def complete_rm(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return self._complete_resource_argument(text, line, begidx, endidx)
+
+    def complete_find(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return self._complete_resource_argument(text, line, begidx, endidx)
 
     def do_ls(self, arg: str) -> None:
         """List a directory or resource collection: ls [OPTION]... [PATH]."""
@@ -3337,6 +3388,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             self.session_region = session_region
             self._restore_locator(snapshot)
             self._previous_locator = current
+            self._prime_current_compartment_completion()
             self._update_prompt()
             return
         previous = (self._snapshot_locator(), self.session_region)
@@ -3350,6 +3402,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             print(exc)
             return
         self._previous_locator = previous
+        self._prime_current_compartment_completion()
         self._update_prompt()
 
     def do_cat(self, arg: str) -> None:

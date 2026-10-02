@@ -567,6 +567,48 @@ def audit_resource_adapter_kinds_are_declarative() -> dict[str, object]:
     }
 
 
+def audit_limits_namespace() -> dict[str, object]:
+    """Limits is a bounded, read-only service hierarchy."""
+    browser = build_browser()
+    specs = {
+        spec.qualified_name: spec
+        for spec in browser.resource_specs
+        if spec.namespace == "limits"
+    }
+    children = config.RESOURCE_CONTEXT_CHILDREN.get("limits.services", {})
+    expected_children = {
+        "definitions": "limits.limit-definitions",
+        "values": "limits.limit-values",
+    }
+    actual_children = {
+        name: resource_type
+        for name, (resource_type, _api_kwargs, _row_filter_key) in children.items()
+    }
+    services = specs.get("limits.services")
+    definitions = specs.get("limits.limit_definitions")
+    values = specs.get("limits.limit_values")
+    ok = (
+        browser.resolve_namespace_path("limits") == "limits"
+        and services is not None
+        and services.runnable
+        and not services.findable
+        and services.node_capability == "metadata-record"
+        and definitions is not None
+        and definitions.node_capability == "terminal-record-set"
+        and values is not None
+        and values.node_capability == "terminal-record-set"
+        and actual_children == expected_children
+        and all(
+            api_kwargs == (("service_name", "name"),)
+            for _name, (_resource_type, api_kwargs, _row_filter_key) in children.items()
+        )
+    )
+    return {
+        "spelling": "limits services expose terminal definitions and values",
+        "status": "ok" if ok else "missing",
+    }
+
+
 def audit_topology_edges_are_declarative() -> dict[str, object]:
     expected = {
         "network_firewall.network_firewalls",
@@ -1879,6 +1921,9 @@ def audit_ls_cached_collection_path_completion() -> dict[str, object]:
         dev.id: (),
     }
     catalog._collections_snapshot = {dev.id: (cluster_spec.qualified_name,)}
+    catalog.prime_compartment = lambda _id: (_ for _ in ()).throw(
+        AssertionError("completion must not fetch OCI")
+    )
     shell = main.OciNavShell.__new__(main.OciNavShell)
     shell.browser = browser
     shell.catalog = catalog
@@ -1900,12 +1945,70 @@ def audit_ls_cached_collection_path_completion() -> dict[str, object]:
         len("cat bd/dev/containerengine.clusters/"),
         len("cat bd/dev/containerengine.clusters/cl"),
     )
+    browser.current = dev
+    browser.parents = [browser.root, bd]
+    catalog._collections_snapshot = {}
+    fallback_namespace = shell._complete_current_collection_entries("conta")
+    fallback_collection = shell._complete_current_collection_entries("containerengine.")
     ok = completed == ["containerengine.clusters"] and resources == [
         "cluster@1234abcd",
         "cluster@5678efgh",
+    ] and fallback_namespace == ["containerengine."] and fallback_collection == [
+        "containerengine.clusters"
     ]
     return {
         "spelling": "catalog dotted collection and unambiguous resource completion",
+        "status": "ok" if ok else "missing",
+    }
+
+
+def audit_cd_primes_completion_cache() -> dict[str, object]:
+    loads: list[bool] = []
+    requests: list[str] = []
+    shell = main.OciNavShell.__new__(main.OciNavShell)
+    shell.browser = SimpleNamespace(
+        current=SimpleNamespace(id="ocid1.compartment.dev"),
+        list_current_compartment_resource_types=lambda: loads.append(True),
+    )
+    shell.catalog = SimpleNamespace(request_compartment=requests.append)
+    shell._prime_current_compartment_completion()
+    ok = loads == [True] and requests == ["ocid1.compartment.dev"]
+    return {
+        "spelling": "cd primes current-compartment completion inventory",
+        "status": "ok" if ok else "missing",
+    }
+
+
+def audit_cmd_uses_gnu_readline() -> dict[str, object]:
+    """cmd.Cmd must register completion with the configured GNU module."""
+    import cmd
+    import sys
+
+    calls: list[object] = []
+    original_set_completer = main.readline.set_completer
+
+    def record_completer(callback: object) -> None:
+        calls.append(callback)
+        original_set_completer(callback)
+
+    class Probe(cmd.Cmd):
+        prompt = ""
+
+        def do_EOF(self, _arg: str) -> bool:
+            return True
+
+    main.readline.set_completer = record_completer
+    try:
+        probe = Probe()
+        probe.cmdqueue = ["EOF"]
+        probe.cmdloop()
+    finally:
+        main.readline.set_completer = original_set_completer
+    ok = sys.modules.get("readline") is main.readline and any(
+        callable(callback) for callback in calls
+    )
+    return {
+        "spelling": "cmd loop uses GNU readline completion module",
         "status": "ok" if ok else "missing",
     }
 
@@ -2767,7 +2870,13 @@ def audit_static_qualified_completion() -> dict[str, object]:
     leaf_ok = {"state", "status"}.issubset(
         shell._complete_resource_argument("st", "cat st", 4, 6)
     )
-    delimiters = __import__("readline").get_completer_delims()
+    command_names = set(shell.completenames(""))
+    command_root_ok = "ls" in command_names and "core.instances" not in command_names
+    free_text_ok = shell.completedefault("query", "grep query", 5, 10) == []
+    find_ok = shell.complete_find("inst", "find inst", 5, 9) == shell._complete_resource_argument(
+        "inst", "find inst", 5, 9
+    )
+    delimiters = main.readline.get_completer_delims()
     delimiter_ok = all(character not in delimiters for character in ".-:@%")
     return {
         "spelling": "all service <Tab>",
@@ -2777,6 +2886,9 @@ def audit_static_qualified_completion() -> dict[str, object]:
         and slash_ok
         and namespace_ok
         and leaf_ok
+        and command_root_ok
+        and free_text_ok
+        and find_ok
         and delimiter_ok
         else "missing",
         "count": len(completed),
@@ -2994,6 +3106,7 @@ def main_cli() -> int:
             audit_subnet_service_vnic_blockers(),
             audit_network_firewall_namespace(),
             audit_resource_adapter_kinds_are_declarative(),
+            audit_limits_namespace(),
             audit_topology_edges_are_declarative(),
             audit_direct_relationship_fallback_for_instance_images(),
             audit_network_firewall_delete_preflight(),
@@ -3038,6 +3151,8 @@ def main_cli() -> int:
             audit_cluster_work_request_projection(),
             audit_absolute_locator_completion(),
             audit_ls_cached_collection_path_completion(),
+            audit_cd_primes_completion_cache(),
+            audit_cmd_uses_gnu_readline(),
             audit_child_filter_precedes_name_enrichment(),
             audit_find_all_requires_compartment_context(),
             audit_qualified_collection_path_completion(),

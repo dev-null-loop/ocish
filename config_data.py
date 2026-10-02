@@ -301,6 +301,22 @@ NAMESPACE_DISCOVERY = {
             "region_subscriptions": False,
         },
     },
+    "limits": {
+        "client_map": {"limits": "oci.limits.LimitsClient"},
+        "endpoint_family": "limits",
+        # Limits services are API metadata rather than OCI Search resources.
+        # A service is navigable only to expose its definitions and values.
+        "findable_overrides": {
+            "services": False,
+            "limit_definitions": False,
+            "limit_values": False,
+        },
+        "node_capability_overrides": {
+            "services": "metadata-record",
+            "limit_definitions": "terminal-record-set",
+            "limit_values": "terminal-record-set",
+        },
+    },
     "orm": {
         "client_map": {
             "resource_manager": "oci.resource_manager.ResourceManagerClient",
@@ -421,6 +437,18 @@ RESOURCE_CONTEXT_DEFAULTS = {
 }
 
 RESOURCE_CONTEXT_CHILDREN = {
+    "limits.services": {
+        "definitions": (
+            "limits.limit-definitions",
+            (("service_name", "name"),),
+            None,
+        ),
+        "values": (
+            "limits.limit-values",
+            (("service_name", "name"),),
+            None,
+        ),
+    },
     "generative_ai.projects": {
         "files": (
             "generative_ai.project-files",
@@ -1140,6 +1168,23 @@ RESOURCE_ENRICHMENTS = {
 }
 
 LONG_COLUMNS = {
+    "limits.services": [
+        ("name", "Service"),
+        ("description", "Description"),
+    ],
+    "limits.limit_definitions": [
+        ("name", "Limit"),
+        ("scope_type", "Scope"),
+        ("are_quotas_supported", "Quotas"),
+        ("is_eligible_for_limit_increase", "Increase eligible"),
+        ("description", "Description"),
+    ],
+    "limits.limit_values": [
+        ("name", "Limit"),
+        ("value", "Value"),
+        ("scope_type", "Scope"),
+        ("availability_domain", "Availability domain"),
+    ],
     "core.instances": [
         ("name", "Name"),
         ("state", "State"),
@@ -1763,6 +1808,10 @@ LONG_COLUMNS = {
 }
 
 GENERIC_COLUMN_LABELS = {
+    "scope_type": "Scope",
+    "value": "Value",
+    "are_quotas_supported": "Quotas",
+    "is_eligible_for_limit_increase": "Increase eligible",
     "cidr": "CIDR",
     "cidr_block": "CIDR",
     "dns_label": "DNS label",

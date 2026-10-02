@@ -300,7 +300,7 @@ or lists an unseen nested OCI path.
 
 | Input | Completion source |
 | --- | --- |
-| `ls`, `ll`, `cd`, `cat` with a domain/type | Local registered resource specs |
+| `ls`, `ll`, `cd`, `cat` with a domain/type | Active-compartment catalog (after its background refresh) |
 | `~/...` or `/...` | Known current compartment prefix plus local specs |
 | `identity.users/...` or `core/instances/...` | Resource names cached after listing that collection |
 | Inside a resource | Fields, child collections, `logs`, and virtual symlinks |

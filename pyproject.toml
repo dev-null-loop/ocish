@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A virtual Plan 9-style OCI namespace shell"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["oci>=2.184.1", "openai>=2.0", "httpx>=0.28", "oci-genai-auth>=0.1"]
+dependencies = ["oci>=2.184.1", "openai>=2.0", "httpx>=0.28", "oci-genai-auth>=0.1", "gnureadline>=8.2.13"]
 
 [project.scripts]
 ocish = "main:main"
@@ -26,6 +26,7 @@ py-modules = [
     "models",
     "relationships",
     "rendering",
+    "static_schema",
 ]
 
 [tool.ruff]

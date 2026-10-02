@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import cmd
 from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
@@ -8,7 +7,7 @@ if TYPE_CHECKING:
 
 
 class CompletionEngine:
-    """Single offline completion policy for every shell command."""
+    """Offline completion for navigable OCI namespace nodes only."""
 
     MODES: ClassVar[frozenset[str]] = frozenset({"off", "static", "cached", "catalog"})
 
@@ -24,16 +23,24 @@ class CompletionEngine:
         self.mode = mode
 
     def command_names(self, text: str) -> list[str]:
+        """Leave command-verb completion to ``cmd.Cmd``.
+
+        A resource type is never a runnable shell command, so do not mix
+        namespace entries such as ``core.instances`` into this result.
+        """
         if self.mode == "off":
             return []
-        qualified = (
-            self.shell._complete_qualified_resource(text)
-            if self.shell._at_completion_root()
-            else []
-        )
-        return [*cmd.Cmd.completenames(self.shell, text), *qualified]
+        return self.shell._command_name_completions(text)
 
-    def path(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+    def resource_path(
+        self, text: str, line: str, begidx: int, endidx: int
+    ) -> list[str]:
+        """Complete only children reachable in the OCI namespace.
+
+        Sources are static registry entries and already-cached OCI reads.  It
+        intentionally never calls OCI and does not try to complete arbitrary
+        command values or free text.
+        """
         if self.mode == "off":
             return []
         argument = self.shell._completion_argument(line, begidx, endidx, text)
@@ -115,3 +122,7 @@ class CompletionEngine:
         if self.mode == "catalog":
             cached |= set(self.shell._catalog_resource_completions(argument))
         return sorted(static | cached)
+
+    def path(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        """Compatibility alias for callers not yet migrated to ``resource_path``."""
+        return self.resource_path(text, line, begidx, endidx)
