@@ -19,7 +19,6 @@ uv run ocish
 `Esc .` always inserts the previous command's last argument. Configure your terminal's Option key as Meta if you want `Option-.` to send the standard `Alt-.` sequence.
 
 ## Linux
-
 Install the Python development headers, compiler toolchain, and GNU Readline development library.
 
 Debian/Ubuntu:

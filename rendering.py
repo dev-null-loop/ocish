@@ -715,6 +715,13 @@ class RenderingMixin:
         node = self._current_node_state()
         topology = getattr(self, "topology_context", None)
         if topology is not None:
+            self._list_topology_node(topology, long_format)
+            return
+        self._list_non_topology_node(node, long_format)
+
+    def _list_topology_node(self, topology: object, long_format: bool) -> None:
+        """Render only the topology projection branch of the namespace."""
+        if topology is not None:
             if topology.level == "service":
                 specs = self._topology_service_specs(topology.namespace or "")
                 entries = [
@@ -811,6 +818,10 @@ class RenderingMixin:
                 for entry in entries:
                     print(entry["name"])
             return
+        return
+
+    def _list_non_topology_node(self, node: object, long_format: bool) -> None:
+        """Render non-topology namespace nodes."""
         if node.kind == "static-schema":
             entries = self.oci_schema.children(self.schema_path)
             if long_format:
@@ -865,6 +876,19 @@ class RenderingMixin:
         }:
             return
         if self.collection_context is not None and self.resource_context is None:
+            self._list_collection_node(long_format)
+            return
+        if self.resource_context is not None:
+            self._list_resource_node(long_format)
+            return
+        if self.namespace_view is not None:
+            self._list_namespace_node(long_format)
+            return
+        self._list_compartment_node(long_format)
+
+    def _list_collection_node(self, long_format: bool) -> None:
+        """Render collection controls and rows."""
+        if self.collection_context is not None and self.resource_context is None:
             if (
                 getattr(self.collection_context.virtual_kind, "value", None)
                 == "time-query"
@@ -908,35 +932,10 @@ class RenderingMixin:
                     print(name)
                 self._print_resources(rows)
             return
-        if self.resource_context is not None:
-            entries = self._resource_entries()
-            if not long_format:
-                for entry in entries:
-                    print(entry.name)
-                return
-            self._print_simple_table(
-                [("name", "Name"), ("type", "Type")],
-                [{"name": entry.name, "type": entry.kind} for entry in entries],
-            )
-            return
-        if self.namespace_view is not None:
-            specs = [
-                spec
-                for spec in self.browser.resource_specs_for_namespace(
-                    self.namespace_view
-                )
-                if self.browser._is_public_resource_spec(spec)
-            ]
-            if long_format:
-                if self._topology_service_specs(self.namespace_view):
-                    print("Views: topology/")
-                self._print_resource_specs_long(specs)
-            else:
-                if self._topology_service_specs(self.namespace_view):
-                    print("topology")
-                for spec in specs:
-                    print(self.browser._normalize_resource_token(spec.name))
-            return
+        return
+
+    def _list_compartment_node(self, long_format: bool) -> None:
+        """Render direct child compartments and present root collections."""
         try:
             resource_types = self.browser.list_current_compartment_resource_types()
         except Exception as exc:
@@ -990,6 +989,32 @@ class RenderingMixin:
             return
         for entry in entries:
             print(entry["name"])
+
+    def _list_resource_node(self, long_format: bool) -> None:
+        """Render a resolved resource leaf without mixing collection policy."""
+        entries = self._resource_entries()
+        if not long_format:
+            for entry in entries:
+                print(entry.name)
+            return
+        self._print_simple_table(
+            [("name", "Name"), ("type", "Type")],
+            [{"name": entry.name, "type": entry.kind} for entry in entries],
+        )
+
+    def _list_namespace_node(self, long_format: bool) -> None:
+        """Render only collections present in the active compartment namespace."""
+        specs = self._present_namespace_specs(self.namespace_view)
+        topology = self._topology_service_specs(self.namespace_view)
+        if long_format:
+            if topology:
+                print("Views: topology/")
+            self._print_resource_specs_long(specs)
+            return
+        if topology:
+            print("topology")
+        for spec in specs:
+            print(self.browser._normalize_resource_token(spec.name))
 
     def _read_current_node(self) -> None:
         if (

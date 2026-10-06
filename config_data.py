@@ -117,13 +117,20 @@ NAMESPACE_DISCOVERY = {
         },
         "endpoint_family": "generative_ai",
         "catalog_discovery": "direct",
+        "openai_data": {
+            "base_url": "https://inference.generativeai.{region}.oci.oraclecloud.com/openai/v1",
+            "api_key_env": "OCISH_OCI_GENAI_API_KEY,OCI_GENAI_API_KEY",
+            "max_pages": "20",
+            "auth_error": "OCI OpenAI project data needs OCI IAM auth or an API key. Install oci-genai-auth, or set OCISH_OCI_GENAI_API_KEY.",
+        },
         "resource_name_overrides": {"generative_ai_projects": "projects"},
         "extra_specs": [
             {
                 "name": "project-files",
                 "endpoint_family": "generative_ai_openai",
                 "scope": "parent-resource",
-                "lister_name": "_list_genai_project_files",
+                "lister_name": "_list_openai_project_data",
+                "adapter_config": {"collection": "files", "project_param": "generative_ai_project_id"},
                 "required_params": ("generative_ai_project_id",),
                 "accepted_params": ("generative_ai_project_id",),
                 "runnable": False,
@@ -133,7 +140,8 @@ NAMESPACE_DISCOVERY = {
                 "name": "project-containers",
                 "endpoint_family": "generative_ai_openai",
                 "scope": "parent-resource",
-                "lister_name": "_list_genai_project_containers",
+                "lister_name": "_list_openai_project_data",
+                "adapter_config": {"collection": "containers", "project_param": "generative_ai_project_id"},
                 "required_params": ("generative_ai_project_id",),
                 "accepted_params": ("generative_ai_project_id",),
                 "runnable": False,
@@ -143,7 +151,8 @@ NAMESPACE_DISCOVERY = {
                 "name": "project-vector-stores",
                 "endpoint_family": "generative_ai_openai",
                 "scope": "parent-resource",
-                "lister_name": "_list_genai_project_vector_stores",
+                "lister_name": "_list_openai_project_data",
+                "adapter_config": {"collection": "vector_stores", "project_param": "generative_ai_project_id"},
                 "required_params": ("generative_ai_project_id",),
                 "accepted_params": ("generative_ai_project_id",),
                 "runnable": False,
@@ -153,7 +162,8 @@ NAMESPACE_DISCOVERY = {
                 "name": "container-files",
                 "endpoint_family": "generative_ai_openai",
                 "scope": "parent-resource",
-                "lister_name": "_list_genai_container_files",
+                "lister_name": "_list_openai_project_data",
+                "adapter_config": {"collection": "containers.files", "project_param": "generative_ai_project_id", "parent_param": "container_id"},
                 "required_params": ("container_id",),
                 "accepted_params": ("container_id",),
                 "runnable": False,
@@ -163,7 +173,8 @@ NAMESPACE_DISCOVERY = {
                 "name": "vector-store-files",
                 "endpoint_family": "generative_ai_openai",
                 "scope": "parent-resource",
-                "lister_name": "_list_genai_vector_store_files",
+                "lister_name": "_list_openai_project_data",
+                "adapter_config": {"collection": "vector_stores.files", "project_param": "generative_ai_project_id", "parent_param": "vector_store_id"},
                 "required_params": ("vector_store_id",),
                 "accepted_params": ("vector_store_id",),
                 "runnable": False,
@@ -397,6 +408,15 @@ TOPOLOGY_ROOTS = {
     "network_firewall": ("network_firewall.network_firewalls",),
     "containerengine": ("containerengine.clusters",),
     "load_balancer": ("load_balancer.load_balancers",),
+}
+
+# Virtual directories that structure every topology projection.  This is
+# topology policy, not completion policy: consumers use it through the shell's
+# generic topology-child resolver.
+TOPOLOGY_STATIC_CHILDREN = {
+    "root": ("vcns",),
+    "vcn": ("subnets",),
+    "subnet": ("consumers",),
 }
 
 RESOURCE_CONTEXT_DEFAULTS = {

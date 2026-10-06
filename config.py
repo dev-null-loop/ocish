@@ -19,6 +19,7 @@ from config_data import (
     TIME_QUERY_PROVIDERS,
     TOPOLOGY_EDGES,
     TOPOLOGY_ROOTS,
+    TOPOLOGY_STATIC_CHILDREN,
 )
 
 __all__ = [
@@ -40,4 +41,5 @@ __all__ = [
     "TIME_QUERY_PROVIDERS",
     "TOPOLOGY_EDGES",
     "TOPOLOGY_ROOTS",
+    "TOPOLOGY_STATIC_CHILDREN",
 ]

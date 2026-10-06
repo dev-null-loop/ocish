@@ -30,6 +30,7 @@ from config import (
     TIME_QUERY_PROVIDERS,
     TOPOLOGY_EDGES,
     TOPOLOGY_ROOTS,
+    TOPOLOGY_STATIC_CHILDREN,
 )
 from deletion import DeletionManager
 from inventory import ActiveRegionCatalog, OciCompartmentBrowser
@@ -441,6 +442,17 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                 pass
         self._request_current_compartment_catalog()
 
+    def _prime_collection_completion(self) -> None:
+        """Populate names for a newly entered ordinary collection."""
+        context = getattr(self, "collection_context", None)
+        if not isinstance(context, CollectionContext) or context.virtual_kind is not None:
+            return
+        try:
+            self._collection_rows()
+        except (oci.exceptions.ServiceError, OSError, ValueError):
+            # Collection entry discovery must not make a successful cd fail.
+            pass
+
     def _known_compartment_collections(self, compartment_id: str) -> tuple[str, ...]:
         """Return live collection types from the catalog, falling back to its cache."""
         catalog = getattr(self, "catalog", None)
@@ -460,6 +472,33 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             if cached is not None
             else ()
         )
+
+    def _present_namespace_specs(self, namespace: str) -> list[ResourceSpec]:
+        """Return flat, public collections actually present in this compartment."""
+        current = getattr(self.browser, "current", None)
+        if current is None:
+            return [
+                spec
+                for spec in self.browser.resource_specs_for_namespace(namespace)
+                if self.browser._is_public_resource_spec(spec)
+            ]
+        specs: list[ResourceSpec] = []
+        for qualified_name in self._known_compartment_collections(current.id):
+            try:
+                spec = self.browser.resolve_resource_spec(qualified_name)
+            except ValueError:
+                continue
+            hierarchy = getattr(self, "_resource_hierarchy", None)
+            if (
+                spec.namespace == namespace
+                and self.browser._is_public_resource_spec(spec)
+                and (
+                    hierarchy is None
+                    or hierarchy.policy_for(spec).permits_flat_access
+                )
+            ):
+                specs.append(spec)
+        return sorted(specs, key=lambda spec: spec.name)
 
     def _relative_browser_path(self) -> str:
         path = self.browser.get_path()
@@ -704,10 +743,26 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         return "/" + "/".join(parts)
 
     def _topology_service_specs(self, namespace: str) -> list[ResourceSpec]:
+        present = {
+            spec.qualified_name for spec in self._present_namespace_specs(namespace)
+        }
         return [
             self.browser.resolve_resource_spec(resource_type)
             for resource_type in TOPOLOGY_ROOTS.get(namespace, ())
+            if resource_type in present
         ]
+
+    def _topology_completion_entries(
+        self, topology: TopologyContext | None
+    ) -> tuple[str, ...]:
+        """Return declaratively defined topology children for a navigation state."""
+        if topology is not None and topology.level == "service":
+            return tuple(
+                self.browser._normalize_resource_token(spec.name)
+                for spec in self._topology_service_specs(topology.namespace or "")
+            )
+        level = topology.level if topology is not None else "root"
+        return TOPOLOGY_STATIC_CHILDREN.get(level, ())
 
     def _topology_vcns(self) -> list[ResourceRow]:
         return self.browser.list_resources("core.vcns")
@@ -1028,194 +1083,21 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             return True
         if self.resource_context is not None:
             children = self._resource_context_children()
-            if (
-                self.resource_context.spec.qualified_name == "core.vcns"
-                and normalized == "topology"
-            ):
-                self.topology_context = TopologyContext(
-                    level="subnets", vcn=self.resource_context.row, embedded=True
-                )
+            if self._try_enter_resource_projection(normalized):
                 return True
-            if (
-                self.resource_context.spec.qualified_name == "core.subnets"
-                and normalized == "blockers"
-            ):
-                self._enter_collection_context(
-                    self.resource_context.spec,
-                    "blockers",
-                    parent_resource=self.resource_context,
-                    virtual_kind=VirtualKind.BLOCKERS,
-                )
+            if self._try_enter_declared_resource_child(normalized, children):
                 return True
-            if normalized in children:
-                collection = children[normalized]
-                spec = self.browser.resolve_resource_spec(collection.resource_type)
-                row_filter = None
-                if collection.row_filter_key:
-                    row_filter = (
-                        collection.row_filter_key,
-                        self.resource_context.row.id,
-                    )
-                self._enter_collection_context(
-                    spec,
-                    normalized,
-                    extra_kwargs=self._resource_context_kwargs(collection),
-                    row_filter=row_filter,
-                    parent_resource=self.resource_context,
-                    # Explicit child API arguments (for example vcn_id) are
-                    # authoritative.  Search projections are only for child
-                    # collections that have no direct list scope.
-                    projection_field=(
-                        collection.projection_field
-                        if spec.runnable and not collection.api_kwargs
-                        else None
-                    ),
-                )
+            if self._try_enter_relationship_collection(normalized):
                 return True
-            if normalized == "relationships":
-                view = self._relationship_namespace().view(self.resource_context)
-                targets_by_id = {
-                    item.row.id: item
-                    for item in (
-                        *(target for _name, target in view.links),
-                        *(
-                            target
-                            for group in view.collections.values()
-                            for target in group
-                        ),
-                    )
-                }
-                targets = tuple(targets_by_id.values())
-                if not targets:
-                    return False
-                spec = next(
-                    target.spec for target in targets if target.spec is not None
-                )
-                self._enter_collection_context(
-                    spec,
-                    "relationships",
-                    parent_resource=self.resource_context,
-                    virtual_kind=VirtualKind.RELATIONSHIPS,
-                    relationship_targets=targets,
-                )
-                return True
-            relationship_targets = self._relationship_collections().get(normalized)
-            if relationship_targets:
-                spec = next(
-                    target.spec
-                    for target in relationship_targets
-                    if target.spec is not None
-                )
-                self._enter_collection_context(
-                    spec,
-                    normalized,
-                    parent_resource=self.resource_context,
-                    virtual_kind=VirtualKind.RELATIONSHIPS,
-                    relationship_targets=relationship_targets,
-                )
-                return True
-            virtual_children = {
-                **RESOURCE_VIRTUAL_CHILDREN.get("default", {}),
-                **RESOURCE_VIRTUAL_CHILDREN.get(
-                    self.resource_context.spec.qualified_name, {}
-                ),
-            }
-            if normalized in virtual_children:
-                rule = virtual_children[normalized]
-                if rule is None:
-                    return False
-                kind = str(rule["kind"])
-                spec = (
-                    self.browser.resolve_resource_spec(str(rule["resource_type"]))
-                    if kind == "related-logs"
-                    else self.resource_context.spec
-                )
-                self._enter_collection_context(
-                    spec,
-                    normalized,
-                    parent_resource=self.resource_context,
-                    parent_collection=(
-                        self.collection_context
-                        if kind == VirtualKind.TIME_QUERY.value
-                        else None
-                    ),
-                    virtual_kind=kind,
-                    time_query_provider=(
-                        str(rule["provider"])
-                        if kind == VirtualKind.TIME_QUERY.value
-                        else None
-                    ),
-                    time_query_path=(
-                        (normalized,) if kind == VirtualKind.TIME_QUERY.value else ()
-                    ),
-                    content_prefix="",
-                )
-                return True
-            return False
+            return self._try_enter_virtual_resource_child(normalized)
         if (
             self.collection_context is not None
             and self.collection_context.virtual_kind
             and self.collection_context.virtual_kind
             in {VirtualKind.TIME_QUERY, VirtualKind.TIME_QUERY_SELECTOR}
         ):
-            current = self.collection_context
-            provider = current.time_query_provider or ""
-            controls = set(TIME_QUERY_PROVIDERS[provider]["controls"])
-            options = dict(current.time_query_options)
-            path = current.time_query_path
-            pending = current.time_query_pending
-            if pending is not None:
-                if pending == "page":
-                    try:
-                        options["page_number"] = int(target)
-                    except ValueError:
-                        raise ValueError("query page must be an integer") from None
-                elif pending == "where-field":
-                    self._enter_collection_context(
-                        current.spec,
-                        target,
-                        parent_resource=current.parent_resource,
-                        parent_collection=current.parent_collection,
-                        virtual_kind=VirtualKind.TIME_QUERY_SELECTOR,
-                        time_query_provider=provider,
-                        time_query_options=options,
-                        time_query_path=(*path, target),
-                        time_query_pending=f"where-value:{target}",
-                        previous_collection=current,
-                    )
-                    return True
-                elif pending.startswith("where-value:"):
-                    options["where"] = (
-                        f"{pending.removeprefix('where-value:')}={target}"
-                    )
-                else:
-                    options[pending] = target
-                self._enter_collection_context(
-                    current.spec,
-                    target,
-                    parent_resource=current.parent_resource,
-                    parent_collection=current.parent_collection,
-                    virtual_kind=VirtualKind.TIME_QUERY,
-                    time_query_provider=provider,
-                    time_query_options=options,
-                    time_query_path=(*path, target),
-                    previous_collection=current,
-                )
-                return True
-            if target == "page" or target in controls:
-                self._enter_collection_context(
-                    current.spec,
-                    target,
-                    parent_resource=current.parent_resource,
-                    parent_collection=current.parent_collection,
-                    virtual_kind=VirtualKind.TIME_QUERY_SELECTOR,
-                    time_query_provider=provider,
-                    time_query_options=options,
-                    time_query_path=(*path, target),
-                    time_query_pending=("where-field" if target == "where" else target),
-                    previous_collection=current,
-                )
-                return True
+            return self._try_enter_time_query_selector(target)
+
         try:
             resource_type = (
                 f"{self.namespace_view}.{target}"
@@ -1225,11 +1107,55 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             spec = self.browser.resolve_resource_spec(resource_type)
         except ValueError:
             return False
-        # A locator may use an alias (core.instances, instance, underscores),
-        # but its persisted path always uses the canonical collection name.
+        return self._enter_resolved_collection(spec)
+
+    def _try_enter_time_query_selector(self, target: str) -> bool:
+        """Advance one control segment in a time-query collection."""
+        assert self.collection_context is not None
+        current = self.collection_context
+        provider = current.time_query_provider or ""
+        controls = set(TIME_QUERY_PROVIDERS[provider]["controls"])
+        options = dict(current.time_query_options)
+        path = current.time_query_path
+        pending = current.time_query_pending
+        if pending == "where-field":
+            self._enter_collection_context(
+                current.spec, target, parent_resource=current.parent_resource,
+                parent_collection=current.parent_collection,
+                virtual_kind=VirtualKind.TIME_QUERY_SELECTOR,
+                time_query_provider=provider, time_query_options=options,
+                time_query_path=(*path, target), time_query_pending=f"where-value:{target}",
+                previous_collection=current,
+            )
+            return True
+        if pending is not None:
+            if pending == "page":
+                try:
+                    options["page_number"] = int(target)
+                except ValueError:
+                    raise ValueError("query page must be an integer") from None
+            elif pending.startswith("where-value:"):
+                options["where"] = f"{pending.removeprefix('where-value:')}={target}"
+            else:
+                options[pending] = target
+            kind = VirtualKind.TIME_QUERY
+        elif target == "page" or target in controls:
+            kind = VirtualKind.TIME_QUERY_SELECTOR
+            pending = "where-field" if target == "where" else target
+        else:
+            return False
+        self._enter_collection_context(
+            current.spec, target, parent_resource=current.parent_resource,
+            parent_collection=current.parent_collection, virtual_kind=kind,
+            time_query_provider=provider, time_query_options=options,
+            time_query_path=(*path, target), time_query_pending=pending if kind == VirtualKind.TIME_QUERY_SELECTOR else None,
+            previous_collection=current,
+        )
+        return True
+
+    def _enter_resolved_collection(self, spec: ResourceSpec) -> bool:
+        """Enter a flat collection after policy and root-view resolution."""
         normalized = self.browser._normalize_resource_token(spec.name)
-        # Compatibility names such as `instance` still enter the canonical
-        # service mount.  The prompt must never hide that navigation state.
         if self.namespace_view is None:
             self.namespace_view = spec.namespace
         if self.resource_context is None and self.collection_context is None:
@@ -1262,50 +1188,103 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         )
         return True
 
+    def _try_enter_resource_projection(self, normalized: str) -> bool:
+        """Enter resource-type-specific virtual projections."""
+        assert self.resource_context is not None
+        if self.resource_context.spec.qualified_name == "core.vcns" and normalized == "topology":
+            self.topology_context = TopologyContext(
+                level="subnets", vcn=self.resource_context.row, embedded=True
+            )
+            return True
+        if self.resource_context.spec.qualified_name == "core.subnets" and normalized == "blockers":
+            self._enter_collection_context(
+                self.resource_context.spec, "blockers", parent_resource=self.resource_context,
+                virtual_kind=VirtualKind.BLOCKERS,
+            )
+            return True
+        return False
+
+    def _try_enter_declared_resource_child(
+        self, normalized: str, children: dict[str, ResourceChildCollection]
+    ) -> bool:
+        """Enter a declaratively registered child collection of a resource."""
+        if normalized not in children:
+            return False
+        assert self.resource_context is not None
+        collection = children[normalized]
+        spec = self.browser.resolve_resource_spec(collection.resource_type)
+        row_filter = (
+            (collection.row_filter_key, self.resource_context.row.id)
+            if collection.row_filter_key
+            else None
+        )
+        self._enter_collection_context(
+            spec,
+            normalized,
+            extra_kwargs=self._resource_context_kwargs(collection),
+            row_filter=row_filter,
+            parent_resource=self.resource_context,
+            projection_field=(
+                collection.projection_field
+                if spec.runnable and not collection.api_kwargs
+                else None
+            ),
+        )
+        return True
+
+    def _try_enter_relationship_collection(self, normalized: str) -> bool:
+        """Enter the aggregate or named relationship collection of a resource."""
+        assert self.resource_context is not None
+        if normalized == "relationships":
+            view = self._relationship_namespace().view(self.resource_context)
+            targets = tuple(
+                {item.row.id: item for item in (
+                    *(target for _name, target in view.links),
+                    *(target for group in view.collections.values() for target in group),
+                )}.values()
+            )
+        else:
+            targets = self._relationship_collections().get(normalized, ())
+        if not targets:
+            return False
+        spec = next(target.spec for target in targets if target.spec is not None)
+        self._enter_collection_context(
+            spec, normalized, parent_resource=self.resource_context,
+            virtual_kind=VirtualKind.RELATIONSHIPS, relationship_targets=targets,
+        )
+        return True
+
+    def _try_enter_virtual_resource_child(self, normalized: str) -> bool:
+        """Enter a declaratively configured virtual resource child."""
+        assert self.resource_context is not None
+        rules = {
+            **RESOURCE_VIRTUAL_CHILDREN.get("default", {}),
+            **RESOURCE_VIRTUAL_CHILDREN.get(self.resource_context.spec.qualified_name, {}),
+        }
+        rule = rules.get(normalized)
+        if rule is None:
+            return False
+        kind = str(rule["kind"])
+        spec = self.browser.resolve_resource_spec(str(rule["resource_type"])) if kind == "related-logs" else self.resource_context.spec
+        self._enter_collection_context(
+            spec, normalized, parent_resource=self.resource_context,
+            parent_collection=self.collection_context if kind == VirtualKind.TIME_QUERY.value else None,
+            virtual_kind=kind,
+            time_query_provider=str(rule["provider"]) if kind == VirtualKind.TIME_QUERY.value else None,
+            time_query_path=(normalized,) if kind == VirtualKind.TIME_QUERY.value else (),
+            content_prefix="",
+        )
+        return True
+
+
     def _try_enter_resource_from_collection(self, target: str) -> bool:
         if self.collection_context is None:
             return False
         current = self.collection_context
-        if current.virtual_kind is None:
-            options = dict(current.collection_view_options)
-            pending = current.collection_view_pending
-            if pending is not None:
-                if pending == "page":
-                    try:
-                        value: object = int(target)
-                    except ValueError:
-                        raise ValueError("collection page must be an integer") from None
-                    if not 1 <= value <= 20:
-                        raise ValueError("collection page must be between 1 and 20")
-                else:
-                    value = target
-                options[pending] = value
-                self._enter_collection_context(
-                    current.spec,
-                    current.collection_name,
-                    extra_kwargs=dict(current.extra_kwargs),
-                    row_filter=current.row_filter,
-                    parent_resource=current.parent_resource,
-                    parent_collection=current.parent_collection,
-                    projection_field=current.projection_field,
-                    collection_view_options=options,
-                    collection_view_path=(*current.collection_view_path, target),
-                )
-                return True
-            if target in {"page", "name", "state"}:
-                self._enter_collection_context(
-                    current.spec,
-                    current.collection_name,
-                    extra_kwargs=dict(current.extra_kwargs),
-                    row_filter=current.row_filter,
-                    parent_resource=current.parent_resource,
-                    parent_collection=current.parent_collection,
-                    projection_field=current.projection_field,
-                    collection_view_options=options,
-                    collection_view_path=(*current.collection_view_path, target),
-                    collection_view_pending=target,
-                )
-                return True
+        if current.virtual_kind is None and self._try_enter_collection_view_control(
+            current, target
+        ):
+            return True
         if target.startswith("ocid1."):
             resolved = self.browser.resolve_resource_id(
                 self.collection_context.spec, target
@@ -1410,6 +1389,43 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                 self.collection_context.collection_name, target, matches
             )
         )
+
+    def _try_enter_collection_view_control(
+        self, current: CollectionContext, target: str
+    ) -> bool:
+        """Advance page/name/state view controls without mixing row navigation."""
+        options = dict(current.collection_view_options)
+        pending = current.collection_view_pending
+        if pending is not None:
+            if pending == "page":
+                try:
+                    value: object = int(target)
+                except ValueError:
+                    raise ValueError("collection page must be an integer") from None
+                if not 1 <= value <= 20:
+                    raise ValueError("collection page must be between 1 and 20")
+            else:
+                value = target
+            options[pending] = value
+            self._enter_collection_context(
+                current.spec, current.collection_name,
+                extra_kwargs=dict(current.extra_kwargs), row_filter=current.row_filter,
+                parent_resource=current.parent_resource, parent_collection=current.parent_collection,
+                projection_field=current.projection_field, collection_view_options=options,
+                collection_view_path=(*current.collection_view_path, target),
+            )
+            return True
+        if target not in {"page", "name", "state"}:
+            return False
+        self._enter_collection_context(
+            current.spec, current.collection_name,
+            extra_kwargs=dict(current.extra_kwargs), row_filter=current.row_filter,
+            parent_resource=current.parent_resource, parent_collection=current.parent_collection,
+            projection_field=current.projection_field, collection_view_options=options,
+            collection_view_path=(*current.collection_view_path, target),
+            collection_view_pending=target,
+        )
+        return True
 
     @staticmethod
     def _row_is_navigable(spec: ResourceSpec, row: ResourceRow) -> bool:
@@ -1531,6 +1547,79 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             return
         self.browser.change_directory("..")
 
+    def _advance_topology(self, part: str) -> None:
+        """Advance one topology path component through the single state machine."""
+        current = self.topology_context
+        if current is None:
+            if part != "vcns":
+                raise ValueError("topology contains: vcns")
+            self.topology_context = TopologyContext(level="vcns")
+            return
+        if current.level == "service":
+            spec = next(
+                (
+                    item
+                    for item in self._topology_service_specs(current.namespace or "")
+                    if self.browser._normalize_resource_token(item.name)
+                    == self.browser._normalize_resource_token(part)
+                ),
+                None,
+            )
+            if spec is None:
+                raise ValueError(f"topology collection not found: {part}")
+            self.topology_context = TopologyContext(
+                level="service-collection", namespace=current.namespace, collection_spec=spec
+            )
+            return
+        if current.level == "service-collection":
+            assert current.collection_spec is not None
+            matches = self.browser._matching_rows(
+                self.browser.list_resources(current.collection_spec.qualified_name), part
+            )
+            if len(matches) != 1:
+                raise ValueError(f"topology resource not found: {part}")
+            if current.collection_spec.qualified_name == "core.vcns":
+                self.topology_context = TopologyContext("vcn", matches[0], namespace=current.namespace)
+                return
+            self.collection_context = CollectionContext(current.collection_spec, self.browser._normalize_resource_token(current.collection_spec.name))
+            self.resource_context = ResourceContext(current.collection_spec, matches[0])
+            self.topology_context = None
+            return
+        if current.level == "vcns":
+            matches = self.browser._matching_rows(self._topology_vcns(), part)
+            if len(matches) != 1:
+                raise ValueError(f"VCN not found: {part}")
+            self.topology_context = TopologyContext("vcn", matches[0], namespace=current.namespace)
+            return
+        if current.level == "vcn":
+            if part != "subnets":
+                raise ValueError("topology VCN contains: subnets")
+            self.topology_context = TopologyContext("subnets", current.vcn, embedded=current.embedded, namespace=current.namespace)
+            return
+        if current.level == "subnets":
+            assert current.vcn is not None
+            matches = self.browser._matching_rows(self._topology_subnets(current.vcn), part)
+            if len(matches) != 1:
+                raise ValueError(f"subnet not found in topology: {part}")
+            self.topology_context = TopologyContext("subnet", current.vcn, matches[0], current.embedded, current.namespace)
+            return
+        if current.level == "subnet":
+            if part != "consumers":
+                raise ValueError("topology subnet contains: consumers")
+            self.topology_context = TopologyContext("consumers", current.vcn, current.subnet, current.embedded, current.namespace)
+            return
+        assert current.subnet is not None
+        targets = self._topology_consumers(current.subnet)
+        match = next((item for item in targets if self._topology_projection_name(item, targets) == part), None)
+        if match is None or match.spec is None:
+            raise ValueError(f"topology consumer not found: {part}")
+        self.browser.change_to_compartment(match.compartment_id)
+        self.namespace_view = match.spec.namespace
+        self.collection_context = CollectionContext(match.spec, self.browser._normalize_resource_token(match.spec.name))
+        self.resource_context = ResourceContext(match.spec, match.row)
+        self.mount_collection = None if self.mount_collection and self.mount_collection.name == "topology" else self.mount_collection
+        self.topology_context = None
+
     def _snapshot_locator(
         self,
     ) -> tuple[
@@ -1647,195 +1736,12 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                     continue
                 if self.mount_leaf is not None:
                     raise ValueError(f"not found: {part}")
-                if (
-                    self.topology_context is not None
-                    and self.topology_context.namespace is not None
-                ):
-                    current = self.topology_context
-                    if current.level == "service":
-                        spec = next(
-                            (
-                                item
-                                for item in self._topology_service_specs(
-                                    current.namespace
-                                )
-                                if self.browser._normalize_resource_token(item.name)
-                                == self.browser._normalize_resource_token(part)
-                            ),
-                            None,
-                        )
-                        if spec is None:
-                            raise ValueError(f"topology collection not found: {part}")
-                        self.topology_context = TopologyContext(
-                            level="service-collection",
-                            namespace=current.namespace,
-                            collection_spec=spec,
-                        )
-                        continue
-                    if current.level == "service-collection":
-                        assert current.collection_spec is not None
-                        matches = self.browser._matching_rows(
-                            self.browser.list_resources(
-                                current.collection_spec.qualified_name
-                            ),
-                            part,
-                        )
-                        if len(matches) != 1:
-                            raise ValueError(f"topology resource not found: {part}")
-                        row = matches[0]
-                        if current.collection_spec.qualified_name == "core.vcns":
-                            self.topology_context = TopologyContext(
-                                level="vcn", vcn=row, namespace=current.namespace
-                            )
-                            continue
-                        self.collection_context = CollectionContext(
-                            spec=current.collection_spec,
-                            collection_name=self.browser._normalize_resource_token(
-                                current.collection_spec.name
-                            ),
-                        )
-                        self.resource_context = ResourceContext(
-                            spec=current.collection_spec, row=row
-                        )
-                        self.topology_context = None
-                        continue
-                    if current.level == "vcn":
-                        if part != "subnets":
-                            raise ValueError("topology VCN contains: subnets")
-                        self.topology_context = TopologyContext(
-                            level="subnets",
-                            vcn=current.vcn,
-                            namespace=current.namespace,
-                        )
-                        continue
-                    if current.level == "subnets":
-                        assert current.vcn is not None
-                        matches = self.browser._matching_rows(
-                            self._topology_subnets(current.vcn), part
-                        )
-                        if len(matches) != 1:
-                            raise ValueError(f"subnet not found in topology: {part}")
-                        self.topology_context = TopologyContext(
-                            level="subnet",
-                            vcn=current.vcn,
-                            subnet=matches[0],
-                            namespace=current.namespace,
-                        )
-                        continue
-                    if current.level == "subnet":
-                        if part != "consumers":
-                            raise ValueError("topology subnet contains: consumers")
-                        self.topology_context = TopologyContext(
-                            level="consumers",
-                            vcn=current.vcn,
-                            subnet=current.subnet,
-                            namespace=current.namespace,
-                        )
-                        continue
-                    if current.level == "consumers":
-                        assert current.subnet is not None
-                        targets = self._topology_consumers(current.subnet)
-                        match = next(
-                            (
-                                item
-                                for item in targets
-                                if self._topology_projection_name(item, targets) == part
-                            ),
-                            None,
-                        )
-                        if match is None or match.spec is None:
-                            raise ValueError(f"topology consumer not found: {part}")
-                        self.browser.change_to_compartment(match.compartment_id)
-                        self.namespace_view = match.spec.namespace
-                        self.collection_context = CollectionContext(
-                            spec=match.spec,
-                            collection_name=self.browser._normalize_resource_token(
-                                match.spec.name
-                            ),
-                        )
-                        self.resource_context = ResourceContext(
-                            spec=match.spec, row=match.row
-                        )
-                        self.topology_context = None
-                        continue
-                if (
+                if self.topology_context is not None or (
                     self.mount_collection is not None
                     and self.mount_collection.name == "topology"
                 ):
-                    current = self.topology_context
-                    if current is None:
-                        if part != "vcns":
-                            raise ValueError("topology contains: vcns")
-                        self.topology_context = TopologyContext(level="vcns")
-                        continue
-                    if current.level == "vcns":
-                        matches = self.browser._matching_rows(
-                            self._topology_vcns(), part
-                        )
-                        if len(matches) != 1:
-                            raise ValueError(f"VCN not found: {part}")
-                        self.topology_context = TopologyContext(
-                            level="vcn", vcn=matches[0]
-                        )
-                        continue
-                    if current.level == "vcn":
-                        if part != "subnets":
-                            raise ValueError("topology VCN contains: subnets")
-                        self.topology_context = TopologyContext(
-                            level="subnets", vcn=current.vcn
-                        )
-                        continue
-                    if current.level == "subnets":
-                        assert current.vcn is not None
-                        matches = self.browser._matching_rows(
-                            self._topology_subnets(current.vcn), part
-                        )
-                        if len(matches) != 1:
-                            raise ValueError(f"subnet not found in topology: {part}")
-                        self.topology_context = TopologyContext(
-                            level="subnet",
-                            vcn=current.vcn,
-                            subnet=matches[0],
-                            embedded=current.embedded,
-                        )
-                        continue
-                    if current.level == "subnet":
-                        if part != "consumers":
-                            raise ValueError("topology subnet contains: consumers")
-                        self.topology_context = TopologyContext(
-                            level="consumers",
-                            vcn=current.vcn,
-                            subnet=current.subnet,
-                            embedded=current.embedded,
-                        )
-                        continue
-                    if current.level == "consumers":
-                        assert current.subnet is not None
-                        targets = self._topology_consumers(current.subnet)
-                        match = next(
-                            (
-                                item
-                                for item in targets
-                                if self._topology_projection_name(item, targets) == part
-                            ),
-                            None,
-                        )
-                        if match is None or match.spec is None:
-                            raise ValueError(f"topology consumer not found: {part}")
-                        self.browser.change_to_compartment(match.compartment_id)
-                        self.namespace_view = match.spec.namespace
-                        self.collection_context = CollectionContext(
-                            spec=match.spec,
-                            collection_name=self.browser._normalize_resource_token(
-                                match.spec.name
-                            ),
-                        )
-                        self.resource_context = ResourceContext(
-                            spec=match.spec, row=match.row
-                        )
-                        self.mount_collection = None
-                        self.topology_context = None
-                        continue
+                    self._advance_topology(part)
+                    continue
                 if self.mount_entry is not None and self.mount_entry.collection not in {
                     "catalog",
                     "region",
@@ -2020,13 +1926,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         if node.kind in {"mount-root", "mount-leaf"}:
             return self._current_mount_payload()
         if node.kind == "domain":
-            specs = [
-                spec
-                for spec in self.browser.resource_specs_for_namespace(
-                    self.namespace_view
-                )
-                if self.browser._is_public_resource_spec(spec)
-            ]
+            specs = self._present_namespace_specs(self.namespace_view)
             return {
                 "kind": "domain",
                 "name": self._namespace_slug(self.namespace_view),
@@ -2192,10 +2092,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                     "name": self.browser._normalize_resource_token(spec.name),
                     "kind": "collection",
                 }
-                for spec in self.browser.resource_specs_for_namespace(
-                    self.namespace_view
-                )
-                if self.browser._is_public_resource_spec(spec)
+                for spec in self._present_namespace_specs(self.namespace_view)
             ]
             if self._topology_service_specs(self.namespace_view):
                 entries.append({"name": "topology", "kind": "topology-directory"})
@@ -2861,7 +2758,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         domain = parent.rsplit("/", 1)[-1]
         return [
             spec.name.replace("_", "-")
-            for spec in self.browser.resource_specs_for_namespace(domain)
+            for spec in self._present_namespace_specs(domain)
             if spec.name.replace("_", "-").startswith(leaf)
         ]
 
@@ -2908,7 +2805,16 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                 entries = ("page", "name", "state")
             else:
                 entries = ()
-            return [entry for entry in entries if entry.startswith(argument)]
+            try:
+                path = self._current_path_suffix().rstrip("/")
+            except AttributeError:
+                path = ""
+            cached_rows = getattr(self, "_completion_cache", {}).get(path, ())
+            return sorted(
+                entry
+                for entry in {*entries, *cached_rows}
+                if entry.startswith(argument)
+            )
         namespace_view = getattr(self, "namespace_view", None)
         if (
             namespace_view is not None
@@ -2917,7 +2823,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         ):
             entries = [
                 spec.name.replace("_", "-")
-                for spec in self.browser.resource_specs_for_namespace(namespace_view)
+                for spec in self._present_namespace_specs(namespace_view)
                 if spec.name.replace("_", "-").startswith(argument)
             ]
             if self._topology_service_specs(namespace_view) and "topology".startswith(
@@ -3389,6 +3295,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             self._restore_locator(snapshot)
             self._previous_locator = current
             self._prime_current_compartment_completion()
+            self._prime_collection_completion()
             self._update_prompt()
             return
         previous = (self._snapshot_locator(), self.session_region)
@@ -3403,6 +3310,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             return
         self._previous_locator = previous
         self._prime_current_compartment_completion()
+        self._prime_collection_completion()
         self._update_prompt()
 
     def do_cat(self, arg: str) -> None:

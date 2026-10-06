@@ -53,37 +53,13 @@ class CompletionEngine:
                 for entry in self.shell.oci_schema.children(self.shell.schema_path)
                 if entry.startswith(argument)
             ]
-        if (
+        topology = getattr(self.shell, "topology_context", None)
+        topology_mount = (
             getattr(self.shell, "mount_collection", None) is not None
             and self.shell.mount_collection.name == "topology"
-            and "/" not in argument
-        ):
-            topology = getattr(self.shell, "topology_context", None)
-            static = {
-                None: ("vcns",),
-                "vcn": ("subnets",),
-                "subnet": ("consumers",),
-            }.get(getattr(topology, "level", None), ())
-            cached = self.shell._completion_cache.get(
-                self.shell._current_path_suffix().rstrip("/"), ()
-            )
-            return sorted(
-                entry for entry in {*static, *cached} if entry.startswith(argument)
-            )
-        topology = getattr(self.shell, "topology_context", None)
-        if topology is not None and "/" not in argument:
-            if topology.level == "service":
-                static = tuple(
-                    self.shell.browser._normalize_resource_token(spec.name)
-                    for spec in self.shell._topology_service_specs(
-                        topology.namespace or ""
-                    )
-                )
-            else:
-                static = {
-                    "vcn": ("subnets",),
-                    "subnet": ("consumers",),
-                }.get(topology.level, ())
+        )
+        if (topology_mount or topology is not None) and "/" not in argument:
+            static = self.shell._topology_completion_entries(topology)
             cached = self.shell._completion_cache.get(
                 self.shell._current_path_suffix().rstrip("/"), ()
             )

@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from contextlib import redirect_stdout, suppress
 from types import SimpleNamespace
 
 import config
 import main
+from sdk_catalog import OciSdkCatalog
+from terraform_schema_overlay import apply as apply_terraform_overlay
 
 
 def build_browser() -> main.OciCompartmentBrowser:
@@ -131,6 +134,62 @@ def audit_compartment_ls_resource_types() -> dict[str, object]:
         "spelling": "compartment ls shows present resource types",
         "status": "ok" if ok else "missing",
         "value": lines,
+    }
+
+
+def audit_namespace_view_uses_current_compartment_inventory() -> dict[str, object]:
+    """`cd core` must expose only the current compartment's core collections."""
+    browser = build_browser()
+    browser.root = main.CompartmentNode(
+        "ocid1.tenancy.example", "tenancy", None, "ACTIVE", None
+    )
+    browser.current = main.CompartmentNode(
+        "ocid1.compartment.dev", "dev", None, "ACTIVE", "ocid1.tenancy.example"
+    )
+    browser.parents = [browser.root]
+    browser.region = lambda: "eu-frankfurt-1"
+    instances = browser.resolve_resource_spec("core.instances")
+    vcns = browser.resolve_resource_spec("core.vcns")
+    users = browser.resolve_resource_spec("identity.users")
+    browser.compartment_resource_type_cache = {
+        ("eu-frankfurt-1", browser.current.id): (
+            9999999999.0,
+            ((instances, 1), (vcns, 1), (users, 1)),
+        )
+    }
+    shell = main.OciNavShell.__new__(main.OciNavShell)
+    shell.browser = browser
+    shell.namespace_view = None
+    shell.collection_context = None
+    shell.resource_context = None
+    shell.mount_collection = None
+    shell.mount_entry = None
+    shell.mount_leaf = None
+    shell.topology_context = None
+    shell.schema_path = ()
+    shell.session_region = "eu-frankfurt-1"
+    shell._resource_hierarchy = main.ResourceHierarchy(
+        browser, shell._build_resource_context_children()
+    )
+    shell._change_locator("core")
+    output = io.StringIO()
+    with redirect_stdout(output):
+        shell._list_current_node(False)
+    listed = output.getvalue().splitlines()
+    completed = shell._context_resource_completions("in")
+    path_completed = shell._complete_namespace_path("core/in")
+    stat_children = shell._stat_children(main.NodeState("domain", "/core"))
+    ok = (
+        shell.namespace_view == "core"
+        and listed == ["topology", "instances", "vcns"]
+        and completed == ["instances"]
+        and path_completed == ["instances"]
+        and [child["name"] for child in stat_children]
+        == ["instances", "vcns", "topology"]
+    )
+    return {
+        "spelling": "namespace view lists and completes current-compartment collections",
+        "status": "ok" if ok else "missing",
     }
 
 
@@ -305,6 +364,27 @@ def audit_generative_ai_child_mappings() -> dict[str, object]:
         "spelling": "Generative AI resource containment",
         "status": "ok" if not missing else "missing",
         "missing": missing,
+    }
+
+
+def audit_generative_ai_data_adapter_metadata() -> dict[str, object]:
+    browser = build_browser()
+    expected = {
+        "generative_ai.project-files": {"collection": "files", "project_param": "generative_ai_project_id"},
+        "generative_ai.project-containers": {"collection": "containers", "project_param": "generative_ai_project_id"},
+        "generative_ai.project-vector-stores": {"collection": "vector_stores", "project_param": "generative_ai_project_id"},
+        "generative_ai.container-files": {"collection": "containers.files", "project_param": "generative_ai_project_id", "parent_param": "container_id"},
+        "generative_ai.vector-store-files": {"collection": "vector_stores.files", "project_param": "generative_ai_project_id", "parent_param": "vector_store_id"},
+    }
+    ok = all(
+        spec.lister_name == "_list_openai_project_data"
+        and dict(spec.adapter_config) == metadata
+        for name, metadata in expected.items()
+        for spec in (browser.resolve_resource_spec(name),)
+    )
+    return {
+        "spelling": "GenAI data paths and parent parameters are spec metadata",
+        "status": "ok" if ok else "missing",
     }
 
 
@@ -1979,6 +2059,48 @@ def audit_cd_primes_completion_cache() -> dict[str, object]:
     }
 
 
+def audit_topology_completion_is_declarative() -> dict[str, object]:
+    calls: list[object] = []
+
+    class Shell:
+        mount_collection = main.MountCollectionContext("topology")
+        topology_context = None
+        _completion_cache: dict[str, tuple[str, ...]] = {}
+
+        def _completion_argument(self, _line, _begidx, _endidx, text):
+            return text
+
+        def _topology_completion_entries(self, topology):
+            calls.append(topology)
+            return ("vcns",)
+
+        def _current_path_suffix(self):
+            return "/topology"
+
+    completed = main.CompletionEngine(Shell()).resource_path("v", "ll v", 3, 4)
+    ok = completed == ["vcns"] and calls == [None]
+    return {
+        "spelling": "topology completion uses declarative child resolver",
+        "status": "ok" if ok else "missing",
+    }
+
+
+def audit_topology_uses_one_transition_machine() -> dict[str, object]:
+    shell = main.OciNavShell.__new__(main.OciNavShell)
+    shell.topology_context = None
+    shell._advance_topology("vcns")
+    root_ok = shell.topology_context == main.TopologyContext(level="vcns")
+    shell.topology_context = main.TopologyContext(
+        level="vcn", vcn=main.ResourceRow("vcn", "ACTIVE", "ocid1.vcn.example")
+    )
+    shell._advance_topology("subnets")
+    child_ok = shell.topology_context is not None and shell.topology_context.level == "subnets"
+    return {
+        "spelling": "topology root and child navigation share one transition machine",
+        "status": "ok" if root_ok and child_ok else "missing",
+    }
+
+
 def audit_cmd_uses_gnu_readline() -> dict[str, object]:
     """cmd.Cmd must register completion with the configured GNU module."""
     import cmd
@@ -2105,6 +2227,23 @@ def audit_collection_completion_is_not_namespace_completion() -> dict[str, objec
     ok = completed == []
     return {
         "spelling": "collection completion excludes namespace resource types",
+        "status": "ok" if ok else "missing",
+    }
+
+
+def audit_collection_entry_name_completion() -> dict[str, object]:
+    browser = build_browser()
+    spec = browser.resolve_resource_spec("core.instances")
+    shell = main.OciNavShell.__new__(main.OciNavShell)
+    shell.browser = browser
+    shell.collection_context = main.CollectionContext(spec, "instances")
+    shell.resource_context = None
+    shell._completion_cache = {"/bd/dev/core/instances": ("api", "bastion")}
+    shell._current_path_suffix = lambda: "/bd/dev/core/instances"
+    completed = shell._context_resource_completions("ba")
+    ok = completed == ["bastion"]
+    return {
+        "spelling": "collection context completes cached entry names",
         "status": "ok" if ok else "missing",
     }
 
@@ -2790,6 +2929,59 @@ def audit_time_query_provider_requests() -> dict[str, object]:
     }
 
 
+def audit_static_schema_components_are_separated() -> dict[str, object]:
+    import static_schema
+
+    tree_source = static_schema.__file__
+    source = open(tree_source, encoding="utf-8").read()
+    ok = (
+        callable(OciSdkCatalog.discover)
+        and "OCISH_TERRAFORM_PROVIDER_OCI_ROOT" not in source
+        and "pkgutil.iter_modules" not in source
+    )
+    return {
+        "spelling": "static schema tree excludes SDK discovery and Terraform overlay",
+        "status": "ok" if ok else "missing",
+    }
+
+
+def audit_static_schema_exposes_sdk_operations() -> dict[str, object]:
+    from static_schema import OciSdkSchemaTree
+
+    tree = OciSdkSchemaTree()
+    clients = tree.children(("core",))
+    operations = tree.children(("core", "ComputeClient", "operations"))
+    payload = tree.payload(("core", "ComputeClient", "operations", "list_instances"))
+    ok = (
+        "ComputeClient" in clients
+        and "list_instances" in operations
+        and payload == {
+            "kind": "operation",
+            "client": "core.ComputeClient",
+            "sdk_method": "list_instances",
+        }
+    )
+    return {
+        "spelling": "static schema exposes installed SDK client operations directly",
+        "status": "ok" if ok else "missing",
+    }
+
+
+def audit_terraform_overlay_is_optional() -> dict[str, object]:
+    resources = {"core": {"instance": ("get_instance",)}}
+    previous = os.environ.pop("OCISH_TERRAFORM_PROVIDER_OCI_ROOT", None)
+    try:
+        apply_terraform_overlay(resources)
+    finally:
+        if previous is not None:
+            os.environ["OCISH_TERRAFORM_PROVIDER_OCI_ROOT"] = previous
+    ok = resources == {"core": {"instance": ("get_instance",)}}
+    return {
+        "spelling": "Terraform schema overlay is optional without configuration",
+        "status": "ok" if ok else "missing",
+    }
+
+
 def audit_static_schema_target_restore() -> dict[str, object]:
     """Reading a static-schema target must not leak its path into the locator."""
     shell = main.OciNavShell.__new__(main.OciNavShell)
@@ -3097,6 +3289,7 @@ def main_cli() -> int:
         + audit_registry_public_taxonomy()
         + [
             audit_compartment_ls_resource_types(),
+            audit_namespace_view_uses_current_compartment_inventory(),
             audit_bare_compartment_completion(),
             audit_identity_compartment_entry_changes_context(),
             audit_resource_status_leaf(),
@@ -3152,12 +3345,15 @@ def main_cli() -> int:
             audit_absolute_locator_completion(),
             audit_ls_cached_collection_path_completion(),
             audit_cd_primes_completion_cache(),
+            audit_topology_completion_is_declarative(),
+            audit_topology_uses_one_transition_machine(),
             audit_cmd_uses_gnu_readline(),
             audit_child_filter_precedes_name_enrichment(),
             audit_find_all_requires_compartment_context(),
             audit_qualified_collection_path_completion(),
             audit_resource_completion_boundary(),
             audit_collection_completion_is_not_namespace_completion(),
+            audit_collection_entry_name_completion(),
             audit_completion_help(),
             audit_completion_modes(),
             audit_cd_previous_locator(),
@@ -3175,6 +3371,9 @@ def main_cli() -> int:
             audit_log_entry_query_paths(),
             audit_time_query_adapter_controls(),
             audit_time_query_provider_requests(),
+            audit_static_schema_components_are_separated(),
+            audit_static_schema_exposes_sdk_operations(),
+            audit_terraform_overlay_is_optional(),
             audit_static_schema_target_restore(),
             audit_registry_completion(),
             audit_static_qualified_completion(),
@@ -3184,6 +3383,7 @@ def main_cli() -> int:
             audit_cluster_node_pool_options(),
             audit_addon_options_metadata_records(),
             audit_generative_ai_child_mappings(),
+            audit_generative_ai_data_adapter_metadata(),
             audit_generative_ai_direct_catalog_presence(),
         ]
     )

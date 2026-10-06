@@ -48,6 +48,7 @@ class ResourceSpec:
     search_type: str | None = None
     node_capability: str = "navigable-resource"
     adapter_kind: str = "resource-tree"
+    adapter_config: tuple[tuple[str, str], ...] = ()
 
     @property
     def qualified_name(self) -> str:

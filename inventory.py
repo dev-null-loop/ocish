@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import re
 import threading
 import time
@@ -19,7 +20,6 @@ from config import (
     RESOURCE_ENRICHMENTS,
     TIME_QUERY_PROVIDERS,
 )
-from genai_data import GenAiProjectDataClient
 from models import CompartmentNode, RelationshipTarget, ResourceRow, ResourceSpec
 
 
@@ -1053,7 +1053,12 @@ class OciCompartmentBrowser:
         spec = self._resolve_resource_spec(resource_type)
         if spec.lister_name:
             lister = getattr(self, spec.lister_name)
-            rows = lister(extra_kwargs or {})
+            parameters = inspect.signature(lister).parameters
+            rows = (
+                lister(extra_kwargs or {}, spec)
+                if len(parameters) >= 2
+                else lister(extra_kwargs or {})
+            )
         else:
             if not spec.runnable and not extra_kwargs:
                 raise ValueError(
@@ -1472,6 +1477,9 @@ class OciCompartmentBrowser:
                         extra_spec.get("node_capability", "navigable-resource")
                     ),
                     adapter_kind=str(extra_spec.get("adapter_kind", adapter_kind)),
+                    adapter_config=tuple(
+                        sorted(dict(extra_spec.get("adapter_config", {})).items())
+                    ),
                 )
             )
         return sorted(specs, key=lambda spec: spec.name)
@@ -1591,58 +1599,100 @@ class OciCompartmentBrowser:
         rows = [self._row_from_oci_item(item) for item in items]
         return sorted(rows, key=lambda row: row.name.lower())
 
-    def _list_genai_project_files(self, kwargs: dict[str, object]) -> list[ResourceRow]:
-        return self._list_genai_project_data(kwargs, "files")
-
-    def _list_genai_project_containers(
-        self, kwargs: dict[str, object]
+    def _list_openai_project_data(
+        self, kwargs: dict[str, object], spec: ResourceSpec
     ) -> list[ResourceRow]:
-        return self._list_genai_project_data(kwargs, "containers")
-
-    def _list_genai_project_vector_stores(
-        self, kwargs: dict[str, object]
-    ) -> list[ResourceRow]:
-        return self._list_genai_project_data(kwargs, "vector_stores")
-
-    def _list_genai_container_files(
-        self, kwargs: dict[str, object]
-    ) -> list[ResourceRow]:
-        return self._list_genai_project_data(kwargs, "containers.files", "container_id")
-
-    def _list_genai_vector_store_files(
-        self, kwargs: dict[str, object]
-    ) -> list[ResourceRow]:
-        return self._list_genai_project_data(
-            kwargs, "vector_stores.files", "vector_store_id"
-        )
-
-    def _list_genai_project_data(
-        self,
-        kwargs: dict[str, object],
-        collection: str,
-        parent_key: str = "generative_ai_project_id",
-    ) -> list[ResourceRow]:
-        project_id = kwargs.get("generative_ai_project_id")
-        parent_id = kwargs.get(parent_key)
+        config = {
+            **dict(NAMESPACE_DISCOVERY[spec.namespace].get("openai_data", {})),
+            **dict(spec.adapter_config),
+        }
+        project_key = config["project_param"]
+        project_id = kwargs.get(project_key)
         if not isinstance(project_id, str) or not project_id:
-            raise ValueError("generative_ai_project_id is required")
-        if not isinstance(parent_id, str) or not parent_id:
-            raise ValueError(f"{parent_key} is required")
-        client = GenAiProjectDataClient(self.region(), self.profile_name)
-        payloads = client.list(
-            project_id,
-            collection,
-            parent_id if parent_key != "generative_ai_project_id" else None,
+            raise ValueError(f"{project_key} is required")
+        request = {"limit": 100}
+        parent_key = config.get("parent_param")
+        if parent_key:
+            parent_id = kwargs.get(parent_key)
+            if not isinstance(parent_id, str) or not parent_id:
+                raise ValueError(f"{parent_key} is required")
+            request[parent_key] = parent_id
+        payloads = self._list_openai_collection(
+            self._openai_project_client(project_id, config),
+            config["collection"],
+            request,
+            int(config["max_pages"]),
         )
         return sorted(
             [
-                self._row_from_genai_data_item(payload, project_id)
+                self._row_from_openai_data_item(payload, project_id)
                 for payload in payloads
             ],
             key=lambda row: row.name.lower(),
         )
 
-    def _row_from_genai_data_item(
+    def _openai_project_client(
+        self, project_id: str, config: dict[str, str]
+    ) -> object:
+        from openai import OpenAI
+
+        base_url = config["base_url"].format(region=self.region())
+        api_key = next(
+            (os.getenv(name) for name in config["api_key_env"].split(",") if os.getenv(name)),
+            None,
+        )
+        if api_key:
+            return OpenAI(base_url=base_url, api_key=api_key, project=project_id)
+        try:
+            import httpx
+            from oci_genai_auth import OciSessionAuth, OciUserPrincipalAuth
+        except ImportError as exc:
+            raise RuntimeError(config["auth_error"]) from exc
+        try:
+            auth = OciSessionAuth(profile_name=self.profile_name or "DEFAULT")
+        except KeyError:
+            auth = OciUserPrincipalAuth(profile_name=self.profile_name or "DEFAULT")
+        return OpenAI(
+            base_url=base_url,
+            api_key="not-used",
+            project=project_id,
+            http_client=httpx.Client(auth=auth),
+        )
+
+    @staticmethod
+    def _list_openai_collection(
+        client: object,
+        collection: str,
+        parameters: dict[str, object],
+        max_pages: int,
+    ) -> list[dict[str, object]]:
+        """Read any dotted collection from an OpenAI-compatible client."""
+        target: object = client
+        for part in collection.split("."):
+            target = getattr(target, part)
+        try:
+            page = target.list(**parameters)
+        except Exception as exc:
+            if exc.__class__.__name__ == "NotFoundError":
+                return []
+            raise
+        items: list[dict[str, object]] = []
+        for _ in range(max_pages):
+            items.extend(self._openai_item_dict(item) for item in page.data)
+            if not page.has_next_page():
+                break
+            page = page.get_next_page()
+        return items
+
+    @staticmethod
+    def _openai_item_dict(item: object) -> dict[str, object]:
+        if hasattr(item, "model_dump"):
+            return dict(item.model_dump())
+        if isinstance(item, dict):
+            return dict(item)
+        return dict(vars(item))
+
+    def _row_from_openai_data_item(
         self, payload: dict[str, object], project_id: str
     ) -> ResourceRow:
         name = str(

@@ -20,13 +20,14 @@ py-modules = [
     "config",
     "config_data",
     "deletion",
-    "genai_data",
     "inventory",
     "main",
     "models",
     "relationships",
     "rendering",
     "static_schema",
+    "sdk_catalog",
+    "terraform_schema_overlay",
 ]
 
 [tool.ruff]
