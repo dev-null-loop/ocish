@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import ClassVar
 
 import oci
-import gnureadline as readline
+
+# Linux Python is linked against GNU Readline as the standard ``readline``
+# module.  macOS commonly uses libedit there, so retain gnureadline on macOS
+# for consistent completion behavior.
+if sys.platform == "darwin":
+    import gnureadline as readline
+else:
+    import readline
 
 # cmd.Cmd imports ``readline`` lazily inside cmdloop.  Make that import resolve
 # to the same GNU Readline module configured by this shell, rather than macOS's
