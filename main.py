@@ -444,9 +444,9 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         if loader is not None:
             try:
                 loader()
-            except Exception:
-                # Navigation must remain usable when inventory is unavailable.
-                pass
+            except Exception as exc:
+                # Navigation remains usable; `cat .` reports this skipped refresh.
+                browser.record_partial_failure("prime_completion_inventory", exc)
         self._request_current_compartment_catalog()
 
     def _prime_collection_completion(self) -> None:
@@ -791,7 +791,8 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
             try:
                 spec = self.browser.resolve_resource_spec(resource_type)
                 rows = self.browser.list_resources(resource_type)
-            except Exception:
+            except Exception as exc:
+                self.browser.record_partial_failure("topology_projection", exc)
                 continue
             for edge in edges:
                 if edge.get("target") != "core.subnets":
@@ -804,7 +805,10 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                             try:
                                 row = self.browser.hydrate_resource_row(row)
                                 value = self._topology_value(row, str(edge["field"]))
-                            except Exception:
+                            except Exception as exc:
+                                self.browser.record_partial_failure(
+                                    "topology_projection_detail", exc
+                                )
                                 # The projection remains bounded: a service
                                 # without a usable detail getter simply does
                                 # not claim an unverified topology edge.
@@ -831,7 +835,10 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                         continue
                     try:
                         via_rows = self.browser.list_resources(via)
-                    except Exception:
+                    except Exception as exc:
+                        self.browser.record_partial_failure(
+                            "topology_projection_intermediate", exc
+                        )
                         continue
                     source_ids = {
                         str(self._topology_value(row, source_field))
@@ -2141,7 +2148,8 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         }
         failure = getattr(self.browser, "last_oci_failure", None)
         if isinstance(failure, dict):
-            payload["failure"] = failure
+            key = "unavailable" if failure.get("state") == "partial" else "failure"
+            payload[key] = failure
         if self.resource_context is not None:
             payload["oci"] = {
                 "type": self.resource_context.spec.qualified_name,

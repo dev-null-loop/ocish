@@ -624,7 +624,8 @@ class OciCompartmentBrowser:
                     ),
                     compartment_id=compartment_id,
                 )
-        except Exception:
+        except Exception as exc:
+            self.record_partial_failure("relationship_target", exc)
             target = None
         if target is None:
             target = self._direct_relationship_target(ocid)
@@ -667,7 +668,8 @@ class OciCompartmentBrowser:
                 row=self._row_from_oci_item(item),
                 compartment_id=compartment_id,
             )
-        except Exception:
+        except Exception as exc:
+            self.record_partial_failure("direct_relationship_target", exc)
             return None
 
     def compartment_chain(self, compartment_id: str) -> list[CompartmentNode]:
@@ -819,7 +821,8 @@ class OciCompartmentBrowser:
             return rows
         try:
             names = self._current_compartment_resource_names()
-        except Exception:
+        except Exception as exc:
+            self.record_partial_failure("current_compartment_resource_names", exc)
             names = {}
         enriched: list[ResourceRow] = []
         for row in rows:
@@ -853,7 +856,8 @@ class OciCompartmentBrowser:
                         retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY,
                     ).data
                     value = str(getattr(response, response_attr, fallback) or fallback)
-                except Exception:
+                except Exception as exc:
+                    self.record_partial_failure("resource_enrichment", exc)
                     value = str(fallback)
                 enriched.append(row.with_detail(detail, value))
                 if index + 1 < len(rows):
@@ -962,8 +966,8 @@ class OciCompartmentBrowser:
             )
             if name:
                 return str(name)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.record_partial_failure("resolve_resource_name", exc)
         direct = self._resolve_name_via_direct_get(ocid)
         if direct is not None:
             return direct
@@ -981,7 +985,8 @@ class OciCompartmentBrowser:
             client_attr, method_name = getter_ref
             client = getattr(self, client_attr)
             data = getattr(client, method_name)(ocid).data
-        except Exception:
+        except Exception as exc:
+            self.record_partial_failure("resolve_resource_name_direct", exc)
             return None
         name = getattr(data, "display_name", None) or getattr(data, "name", None)
         return str(name) if name else None
@@ -997,7 +1002,8 @@ class OciCompartmentBrowser:
         try:
             client_attr, method_name = getter_ref
             item = getattr(getattr(self, client_attr), method_name)(row.id).data
-        except Exception:
+        except Exception as exc:
+            self.record_partial_failure("hydrate_resource_row", exc)
             return row
         return self._row_from_oci_item(item)
 
@@ -1568,7 +1574,8 @@ class OciCompartmentBrowser:
                     rows = self._list_generic_resource(
                         spec, compartment_id=compartment_id
                     )
-                except Exception:
+                except Exception as exc:
+                    self.record_partial_failure("discover_namespace_resources", exc)
                     continue
                 if rows:
                     resources.append((spec, rows))
@@ -2310,6 +2317,15 @@ class OciCompartmentBrowser:
         raise RuntimeError("unreachable")
 
     def _record_oci_failure(self, func: Callable[..., object], exc: Exception) -> None:
+        self._record_failure(
+            getattr(func, "__name__", type(func).__name__), exc, state="error"
+        )
+
+    def record_partial_failure(self, operation: str, exc: Exception) -> None:
+        """Record a skipped optional OCI read for the current stat envelope."""
+        self._record_failure(operation, exc, state="partial")
+
+    def _record_failure(self, operation: str, exc: Exception, *, state: str) -> None:
         status = getattr(exc, "status", None)
         code = getattr(exc, "code", None)
         message = str(getattr(exc, "message", None) or exc)
@@ -2324,8 +2340,9 @@ class OciCompartmentBrowser:
         elif status == 429:
             kind = "throttled"
         self.last_oci_failure = {
+            "state": state,
             "kind": kind,
-            "operation": getattr(func, "__name__", type(func).__name__),
+            "operation": operation,
             "status": status,
             "code": code,
             "message": message,
@@ -2980,7 +2997,8 @@ class OciCompartmentBrowser:
         )
         try:
             search_items = self.resource_search.search_resources(details).data.items
-        except Exception:
+        except Exception as exc:
+            self.record_partial_failure("search_orm_jobs", exc)
             search_items = []
         for item in search_items:
             row = self._row_from_oci_item(item)
@@ -3355,7 +3373,8 @@ class OciCompartmentBrowser:
                 continue
             try:
                 vnic = self.virtual_network.get_vnic(attachment.vnic_id).data
-            except Exception:
+            except Exception as exc:
+                self.record_partial_failure("enrich_instance_vnic", exc)
                 continue
             result[attachment.instance_id] = {
                 "public_ip": getattr(vnic, "public_ip", None) or "-",

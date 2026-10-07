@@ -68,7 +68,8 @@ class RelationshipNamespace:
         }
         try:
             rows = self.shell.browser.list_resources(resource_type, extra_kwargs=kwargs)
-        except Exception:
+        except Exception as exc:
+            self.shell.browser.record_partial_failure("relationship_projection", exc)
             return None
         row = next((item for item in rows if item.id == target_id), None)
         if row is None:
@@ -162,7 +163,10 @@ class RelationshipNamespace:
                             self.shell.browser.virtual_network.get_vnic, vnic_id
                         ).data
                         subnet_id = getattr(vnic, "subnet_id", None)
-                    except Exception:
+                    except Exception as exc:
+                        self.shell.browser.record_partial_failure(
+                            "instance_vnic_subnet_projection", exc
+                        )
                         continue
                     if not isinstance(subnet_id, str):
                         continue

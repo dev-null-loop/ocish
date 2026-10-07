@@ -309,7 +309,7 @@ or lists an unseen nested OCI path.
 ## Validation
 
 ```bash
-python3 validate_core_paths.py
+uv run pytest
 ```
 
 The audit validates registered resource resolution, hierarchy ownership versus

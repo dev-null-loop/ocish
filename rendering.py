@@ -256,8 +256,9 @@ class RenderingMixin:
                 self.browser.parents = list(parents)
                 try:
                     rows = self.browser.list_resources(spec.qualified_name)
-                except Exception:
-                    break
+                except Exception as exc:
+                    self.browser.record_partial_failure("find_resource_list", exc)
+                    continue
                 path = "/" + "/".join(item.name for item in [*parents, node])
                 for row in rows:
                     if (
