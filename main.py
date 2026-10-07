@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import cmd
 import json
+import locale
 import re
 import shlex
 import shutil
@@ -360,6 +361,10 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
         )
         readline.set_completer_delims(delimiters)
         readline.parse_and_bind('"\\e.": yank-last-arg')
+        try:
+            "≥".encode(locale.getencoding())
+        except UnicodeEncodeError:
+            return
         readline.parse_and_bind('"≥": yank-last-arg')
 
     def _build_resource_context_children(

@@ -4,6 +4,7 @@ from contextlib import suppress
 
 import pytest
 
+import main
 from deletion import DeletionManager
 from inventory import OciCompartmentBrowser
 
@@ -47,6 +48,32 @@ def test_blocking_oci_failure_is_not_marked_partial() -> None:
     assert browser.last_oci_failure["state"] == "error"
     assert browser.last_oci_failure["kind"] == "permission-denied"
     assert browser.last_oci_failure["request_id"] == "request-denied"
+
+
+def test_readline_configuration_skips_unicode_binding_in_ascii_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bindings: list[str] = []
+
+    class Readline:
+        @staticmethod
+        def get_completer_delims() -> str:
+            return " .-:@%"
+
+        @staticmethod
+        def set_completer_delims(_delimiters: str) -> None:
+            return None
+
+        @staticmethod
+        def parse_and_bind(binding: str) -> None:
+            bindings.append(binding)
+
+    monkeypatch.setattr(main, "readline", Readline())
+    monkeypatch.setattr(main.locale, "getencoding", lambda: "ascii")
+
+    main.OciNavShell._configure_readline_completion()
+
+    assert bindings == ['"\\e.": yank-last-arg']
 
 
 @pytest.mark.parametrize(

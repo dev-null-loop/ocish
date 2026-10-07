@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+SUPPORT_CLIENTS = {
+    "resource_search": "oci.resource_search.ResourceSearchClient",
+}
+
 NAMESPACE_DISCOVERY = {
     "core": {
         "client_map": {
@@ -23,6 +27,13 @@ NAMESPACE_DISCOVERY = {
             "network_security_group_security_rules": "terminal-record-set",
             "route_rules": "terminal-record-set",
             "security_list_rules": "terminal-record-set",
+        },
+        "adapter_config_overrides": {
+            "images": {
+                "canonical_search_field": "compartment_id",
+                "canonical_search_owned": "custom-images",
+                "canonical_search_catalog": "platform-images",
+            },
         },
         "extra_specs": [
             {
@@ -215,9 +226,13 @@ NAMESPACE_DISCOVERY = {
         "client_map": {
             "logging": "oci.logging.LoggingManagementClient",
         },
+        "support_client_map": {
+            "logging_search": "oci.loggingsearch.LogSearchClient",
+        },
         "endpoint_family": "logging",
     },
     "audit": {
+        "support_client_map": {"audit": "oci.audit.AuditClient"},
         "endpoint_family": "audit",
         "adapter_kind": "bounded-time-query",
         "extra_specs": [
@@ -237,7 +252,10 @@ NAMESPACE_DISCOVERY = {
         "findable_overrides": {"metrics": False},
     },
     "apm": {
-        "client_map": {"apm_domain": "oci.apm_control_plane.ApmDomainClient"},
+        "client_map": {
+            "apm_domain": "oci.apm_control_plane.ApmDomainClient",
+        },
+        "support_client_map": {"apm_query": "oci.apm_traces.QueryClient"},
         "endpoint_family": "apm",
     },
     "log_analytics": {

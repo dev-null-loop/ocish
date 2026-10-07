@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import inspect
 import json
 import os
@@ -18,6 +19,7 @@ from config import (
     NAMESPACE_DISCOVERY,
     NAMESPACE_PATH_SLUGS,
     RESOURCE_ENRICHMENTS,
+    SUPPORT_CLIENTS,
     TIME_QUERY_PROVIDERS,
 )
 from models import CompartmentNode, RelationshipTarget, ResourceRow, ResourceSpec
@@ -185,9 +187,6 @@ class ActiveRegionCatalog:
 
 
 class OciCompartmentBrowser:
-    CANONICAL_SEARCH_VARIANTS: ClassVar[dict[str, tuple[str, str, str]]] = {
-        "core.images": ("compartment_id", "core.custom-images", "core.platform-images"),
-    }
     THROTTLE_RETRIES = 5
     THROTTLE_BASE_DELAY = 0.5
     PROJECTION_CACHE_TTL_SECONDS = 30.0
@@ -250,32 +249,24 @@ class OciCompartmentBrowser:
         self.resource_specs = self._build_resource_specs()
 
     def _rebuild_clients(self) -> None:
-        self.identity = oci.identity.IdentityClient(self.config)
-        self.virtual_network = oci.core.VirtualNetworkClient(self.config)
-        self.compute = oci.core.ComputeClient(self.config)
-        self.compute_management = oci.core.ComputeManagementClient(self.config)
-        self.blockstorage = oci.core.BlockstorageClient(self.config)
-        self.container_engine = oci.container_engine.ContainerEngineClient(self.config)
-        self.generative_ai = oci.generative_ai.GenerativeAiClient(self.config)
-        self.generative_ai_agent = oci.generative_ai_agent.GenerativeAiAgentClient(
-            self.config
-        )
-        self.load_balancer = oci.load_balancer.LoadBalancerClient(self.config)
-        self.network_firewall = oci.network_firewall.NetworkFirewallClient(self.config)
-        self.logging = oci.logging.LoggingManagementClient(self.config)
-        self.logging_search = oci.loggingsearch.LogSearchClient(self.config)
-        self.audit = oci.audit.AuditClient(self.config)
-        self.monitoring = oci.monitoring.MonitoringClient(self.config)
-        self.apm_query = oci.apm_traces.QueryClient(self.config)
-        self.log_analytics = oci.log_analytics.LogAnalyticsClient(self.config)
-        self.object_storage = oci.object_storage.ObjectStorageClient(self.config)
-        self.artifacts = oci.artifacts.ArtifactsClient(self.config)
-        self.devops = oci.devops.DevopsClient(self.config)
-        self.apm_domain = oci.apm_control_plane.ApmDomainClient(self.config)
-        self.dns = oci.dns.DnsClient(self.config)
-        self.limits = oci.limits.LimitsClient(self.config)
-        self.resource_manager = oci.resource_manager.ResourceManagerClient(self.config)
-        self.resource_search = oci.resource_search.ResourceSearchClient(self.config)
+        for attribute, class_path in self._declared_client_classes().items():
+            module_name, class_name = class_path.rsplit(".", 1)
+            client_class = getattr(importlib.import_module(module_name), class_name)
+            setattr(self, attribute, client_class(self.config))
+
+    @staticmethod
+    def _declared_client_classes() -> dict[str, str]:
+        """Return the complete, conflict-free OCI client registry."""
+        clients = dict(SUPPORT_CLIENTS)
+        for namespace, config in NAMESPACE_DISCOVERY.items():
+            for key in ("client_map", "support_client_map"):
+                for attribute, class_path in dict(config.get(key, {})).items():
+                    existing = clients.setdefault(str(attribute), str(class_path))
+                    if existing != class_path:
+                        raise ValueError(
+                            f"conflicting client declaration for {attribute} in {namespace}"
+                        )
+        return clients
 
     def region(self) -> str:
         return str(self.config.get("region", "-"))
@@ -1359,15 +1350,27 @@ class OciCompartmentBrowser:
         self, spec: ResourceSpec, row: ResourceRow
     ) -> ResourceSpec:
         """Resolve registry-declared ownership variants in ambiguous Search types."""
-        variant = self.CANONICAL_SEARCH_VARIANTS.get(spec.qualified_name)
-        if variant is None:
+        config = dict(spec.adapter_config)
+        field = config.get("canonical_search_field")
+        owned_type = config.get("canonical_search_owned")
+        catalog_type = config.get("canonical_search_catalog")
+        if not all(
+            isinstance(value, str) for value in (field, owned_type, catalog_type)
+        ):
             return spec
-        field, owned_type, catalog_type = variant
         hydrated = self.hydrate_resource_row(row)
         value = (hydrated.details or {}).get(field)
         if value in (None, "", "-", "None", self.tenancy_id):
-            return self.resolve_resource_spec(catalog_type)
-        return self.resolve_resource_spec(owned_type)
+            return self.resolve_resource_spec(
+                self._qualified_variant(spec, catalog_type)
+            )
+        return self.resolve_resource_spec(self._qualified_variant(spec, owned_type))
+
+    @staticmethod
+    def _qualified_variant(spec: ResourceSpec, resource_type: str) -> str:
+        if "." in resource_type:
+            return resource_type
+        return f"{spec.namespace}.{resource_type}"
 
     def _build_resource_specs(self) -> list[ResourceSpec]:
         specs: list[ResourceSpec] = []
@@ -1378,29 +1381,6 @@ class OciCompartmentBrowser:
     def _build_namespace_resource_specs(
         self, namespace: str, config: dict[str, object]
     ) -> list[ResourceSpec]:
-        client_classes = {
-            "oci.core.VirtualNetworkClient": oci.core.VirtualNetworkClient,
-            "oci.core.ComputeClient": oci.core.ComputeClient,
-            "oci.core.ComputeManagementClient": oci.core.ComputeManagementClient,
-            "oci.core.BlockstorageClient": oci.core.BlockstorageClient,
-            "oci.container_engine.ContainerEngineClient": oci.container_engine.ContainerEngineClient,
-            "oci.generative_ai.GenerativeAiClient": oci.generative_ai.GenerativeAiClient,
-            "oci.generative_ai_agent.GenerativeAiAgentClient": oci.generative_ai_agent.GenerativeAiAgentClient,
-            "oci.load_balancer.LoadBalancerClient": oci.load_balancer.LoadBalancerClient,
-            "oci.network_firewall.NetworkFirewallClient": oci.network_firewall.NetworkFirewallClient,
-            "oci.logging.LoggingManagementClient": oci.logging.LoggingManagementClient,
-            "oci.audit.AuditClient": oci.audit.AuditClient,
-            "oci.monitoring.MonitoringClient": oci.monitoring.MonitoringClient,
-            "oci.apm_control_plane.ApmDomainClient": oci.apm_control_plane.ApmDomainClient,
-            "oci.log_analytics.LogAnalyticsClient": oci.log_analytics.LogAnalyticsClient,
-            "oci.object_storage.ObjectStorageClient": oci.object_storage.ObjectStorageClient,
-            "oci.artifacts.ArtifactsClient": oci.artifacts.ArtifactsClient,
-            "oci.devops.DevopsClient": oci.devops.DevopsClient,
-            "oci.dns.DnsClient": oci.dns.DnsClient,
-            "oci.identity.IdentityClient": oci.identity.IdentityClient,
-            "oci.limits.LimitsClient": oci.limits.LimitsClient,
-            "oci.resource_manager.ResourceManagerClient": oci.resource_manager.ResourceManagerClient,
-        }
         endpoint_family = str(config["endpoint_family"])
         client_map = config.get("client_map", {})
         custom_listers = dict(config.get("custom_listers", {}))
@@ -1410,11 +1390,13 @@ class OciCompartmentBrowser:
         findable_overrides = dict(config.get("findable_overrides", {}))
         search_type_overrides = dict(config.get("search_type_overrides", {}))
         node_capability_overrides = dict(config.get("node_capability_overrides", {}))
+        adapter_config_overrides = dict(config.get("adapter_config_overrides", {}))
         adapter_kind = str(config.get("adapter_kind", "resource-tree"))
         specs: list[ResourceSpec] = []
         seen: set[str] = set()
         for client_attr, class_name in dict(client_map).items():
-            client_cls = client_classes[str(class_name)]
+            module_name, client_name = str(class_name).rsplit(".", 1)
+            client_cls = getattr(importlib.import_module(module_name), client_name)
             for method_name, method in inspect.getmembers(
                 client_cls, inspect.isfunction
             ):
@@ -1458,6 +1440,15 @@ class OciCompartmentBrowser:
                             source_resource_name, "navigable-resource"
                         ),
                         adapter_kind=adapter_kind,
+                        adapter_config=tuple(
+                            sorted(
+                                dict(
+                                    adapter_config_overrides.get(
+                                        source_resource_name, {}
+                                    )
+                                ).items()
+                            )
+                        ),
                     )
                 )
         for extra in config.get("extra_specs", []):
