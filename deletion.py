@@ -10,7 +10,14 @@ from typing import TYPE_CHECKING
 import oci
 
 from config import DIRECT_GETTERS, RESOURCE_CONTEXT_CHILDREN
-from models import DeleteSpec, ResolvedRmTarget, ResourceContext
+from models import (
+    CompartmentNode,
+    DeleteSpec,
+    ResolvedRmTarget,
+    ResourceContext,
+    ResourceRow,
+    ResourceSpec,
+)
 
 if TYPE_CHECKING:
     from main import OciNavShell
@@ -204,6 +211,194 @@ class DeletionManager:
         )
         print(f"update {step['path']} (-{step['removed_count']} rules)")
 
+    def _accessible_blocker_scopes(
+        self,
+        current: CompartmentNode,
+        parents: tuple[CompartmentNode, ...],
+    ) -> tuple[list[tuple[CompartmentNode, tuple[CompartmentNode, ...]]], bool]:
+        """Return every accessible compartment with its tenancy-relative chain.
+
+        Recursive VCN deletion is explicitly user-invoked, so this bounded
+        tenancy traversal is preferable to silently missing a consumer merely
+        because it lives outside the VCN's owning compartment.
+        """
+        try:
+            children = self.browser.build_active_region_compartment_catalog()
+        except Exception:
+            return [(current, parents)], False
+        nodes = {self.browser.root.id: self.browser.root}
+        for entries in children.values():
+            nodes.update({entry.id: entry for entry in entries})
+
+        def chain_for(node: CompartmentNode) -> tuple[CompartmentNode, ...] | None:
+            chain: list[CompartmentNode] = []
+            cursor = node
+            while cursor.id != self.browser.root.id:
+                chain.append(cursor)
+                if cursor.parent_id not in nodes:
+                    return None
+                cursor = nodes[cursor.parent_id]
+            return tuple(reversed(chain[1:]))
+
+        scopes: list[tuple[CompartmentNode, tuple[CompartmentNode, ...]]] = []
+        for node in sorted(nodes.values(), key=lambda item: item.name.casefold()):
+            if node.id == self.browser.root.id:
+                continue
+            chain = chain_for(node)
+            if chain is not None:
+                scopes.append((node, chain))
+        if current.id not in {node.id for node, _chain in scopes}:
+            scopes.append((current, parents))
+        return scopes, True
+
+    def _canonical_blocker_path(
+        self,
+        spec: ResourceSpec,
+        row: ResourceRow,
+        current: CompartmentNode,
+        parents: tuple[CompartmentNode, ...],
+    ) -> str:
+        return "/".join(
+            (
+                "",
+                self._effective_region(),
+                self.browser.root.name,
+                *(node.name for node in parents),
+                current.name,
+                self._namespace_slug(spec.namespace),
+                self.browser._normalize_resource_token(spec.name),
+                self.browser._sanitize_row_name(row.name),
+            )
+        )
+
+    def _vcn_blocker(
+        self,
+        *,
+        kind: str,
+        spec: ResourceSpec,
+        row: ResourceRow,
+        current: CompartmentNode,
+        parents: tuple[CompartmentNode, ...],
+    ) -> dict[str, str]:
+        return {
+            "kind": kind,
+            "name": row.name,
+            "id": row.id,
+            "canonical_path": self._canonical_blocker_path(
+                spec, row, current, parents
+            ),
+        }
+
+    def _discover_vcn_blockers(
+        self,
+        vcn_context: ResourceContext,
+        subnet_rows: list[ResourceRow],
+        current: CompartmentNode,
+        parents: tuple[CompartmentNode, ...],
+    ) -> tuple[list[dict[str, str]], dict[str, object]]:
+        """Find active VCN consumers across every accessible compartment."""
+        vcn_id = vcn_context.row.id
+        subnet_ids = {row.id for row in subnet_rows}
+        targets = {vcn_id, *subnet_ids}
+        scopes, complete = self._accessible_blocker_scopes(current, parents)
+        blockers: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+
+        def append(blocker: dict[str, str]) -> None:
+            if blocker["id"] not in seen_ids:
+                seen_ids.add(blocker["id"])
+                blockers.append(blocker)
+
+        instance_spec = self.browser.resolve_resource_spec("core.instances")
+        service_operations = (
+            (
+                "network-firewall",
+                "network_firewall.network_firewalls",
+                self.browser.network_firewall.list_network_firewalls,
+            ),
+            (
+                "load-balancer",
+                "load_balancer.load_balancers",
+                self.browser.load_balancer.list_load_balancers,
+            ),
+            ("oke-cluster", "containerengine.clusters", self.browser.container_engine.list_clusters),
+            ("oke-node-pool", "containerengine.node_pools", self.browser.container_engine.list_node_pools),
+            (
+                "oke-virtual-node-pool",
+                "containerengine.virtual_node_pools",
+                self.browser.container_engine.list_virtual_node_pools,
+            ),
+            ("instance-pool", "core.instance_pools", self.browser.compute_management.list_instance_pools),
+            ("cluster-network", "core.cluster_networks", self.browser.compute_management.list_cluster_networks),
+        )
+        for scope_current, scope_parents in scopes:
+            try:
+                attachments = self._list_call_all(
+                    self.browser.compute.list_vnic_attachments,
+                    compartment_id=scope_current.id,
+                )
+            except Exception:
+                complete = False
+                attachments = []
+            for attachment in attachments:
+                instance_id = getattr(attachment, "instance_id", None)
+                vnic_id = getattr(attachment, "vnic_id", None)
+                if not instance_id or not vnic_id:
+                    continue
+                try:
+                    vnic = self.browser.virtual_network.get_vnic(vnic_id).data
+                except Exception:
+                    complete = False
+                    continue
+                if (
+                    getattr(vnic, "subnet_id", None) not in subnet_ids
+                    and getattr(vnic, "vcn_id", None) != vcn_id
+                ):
+                    continue
+                try:
+                    instance = self.browser.compute.get_instance(instance_id).data
+                    row = self.browser._row_from_oci_item(instance)
+                except Exception:
+                    complete = False
+                    row = ResourceRow(str(instance_id), "-", str(instance_id))
+                append(
+                    self._vcn_blocker(
+                        kind="instance",
+                        spec=instance_spec,
+                        row=row,
+                        current=scope_current,
+                        parents=scope_parents,
+                    )
+                )
+            for kind, resource_type, operation in service_operations:
+                try:
+                    items = self._list_call_all(operation, compartment_id=scope_current.id)
+                except Exception:
+                    complete = False
+                    continue
+                spec = self.browser.resolve_resource_spec(resource_type)
+                for item in items:
+                    payload = oci.util.to_dict(item)
+                    if (
+                        not isinstance(payload, dict)
+                        or self._is_terminal_blocker_payload(payload)
+                        or not self._payload_contains_any(payload, targets)
+                    ):
+                        continue
+                    append(
+                        self._vcn_blocker(
+                            kind=kind,
+                            spec=spec,
+                            row=self.browser._row_from_oci_item(item),
+                            current=scope_current,
+                            parents=scope_parents,
+                        )
+                    )
+        return (
+            sorted(blockers, key=lambda blocker: (blocker["kind"], blocker["name"].casefold())),
+            {"compartments": len(scopes), "complete": complete},
+        )
+
     def _build_vcn_rm_plan(self, target: ResolvedRmTarget) -> dict[str, object]:
         resolved_path = target.path
         vcn_context = target.resource_context
@@ -220,7 +415,9 @@ class DeletionManager:
             default_dhcp_options_id = payload.get("default_dhcp_options_id")
             collections: list[dict[str, object]] = []
             subnet_rows = self._list_vcn_child_rows(vcn_context, "subnets")
-            blockers = self._discover_vcn_blockers(vcn_context, subnet_rows)
+            blockers, blocker_scope = self._discover_vcn_blockers(
+                vcn_context, subnet_rows, target.compartment_current, target.compartment_parents
+            )
             for collection_name in self.VCN_RECURSIVE_COLLECTION_ORDER:
                 if collection_name == "route-table-cleanup":
                     collections.append(
@@ -257,6 +454,7 @@ class DeletionManager:
                 "path": resolved_path,
                 "resource_context": vcn_context,
                 "blockers": blockers,
+                "blocker_scope": blocker_scope,
                 "collections": collections,
                 "direct_delete_spec": delete_spec,
             }
@@ -267,13 +465,25 @@ class DeletionManager:
             build,
         )
 
+    @staticmethod
+    def _format_blocker(blocker: dict[str, str]) -> str:
+        canonical_path = blocker.get("canonical_path")
+        suffix = f" -> {canonical_path}" if canonical_path else ""
+        return f"{blocker['kind']}: {blocker['name']} ({blocker['id']}){suffix}"
+
     def _print_vcn_rm_plan(self, plan: dict[str, object]) -> None:
         print(f"would rm -r {plan['path']}")
+        blocker_scope = plan["blocker_scope"]
+        print(
+            "blocker scan: "
+            f"{blocker_scope['compartments']} accessible compartment(s)"
+            + (" (incomplete)" if not blocker_scope["complete"] else "")
+        )
         blockers = plan["blockers"]
         if blockers:
             print("blockers:")
             for blocker in blockers[:20]:
-                print(f"  {blocker['kind']}: {blocker['name']} ({blocker['id']})")
+                print(f"  {self._format_blocker(blocker)}")
             if len(blockers) > 20:
                 print(f"  ... and {len(blockers) - 20} more")
         for collection in plan["collections"]:
@@ -323,9 +533,12 @@ class DeletionManager:
         if blockers:
             print("delete blocked:")
             print(f"path: {plan['path']}")
+            blocker_scope = plan["blocker_scope"]
+            if not blocker_scope["complete"]:
+                print("warning: blocker scan was limited to reachable compartments")
             print("blockers must be removed first:")
             for blocker in blockers[:20]:
-                print(f"  {blocker['kind']}: {blocker['name']} ({blocker['id']})")
+                print(f"  {self._format_blocker(blocker)}")
             if len(blockers) > 20:
                 print(f"  ... and {len(blockers) - 20} more")
             return

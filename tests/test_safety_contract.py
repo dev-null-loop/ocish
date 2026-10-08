@@ -7,6 +7,7 @@ import pytest
 import main
 from deletion import DeletionManager
 from inventory import OciCompartmentBrowser
+from models import CompartmentNode, ResourceRow, ResourceSpec
 
 
 class _ServiceUnavailable(Exception):
@@ -21,6 +22,35 @@ class _PermissionDenied(Exception):
     code = "NotAuthorized"
     message = "not authorized"
     request_id = "request-denied"
+
+
+class _BlockerBrowser:
+    root = CompartmentNode("root", "tenancy", None, "ACTIVE", None)
+
+    def build_active_region_compartment_catalog(self):
+        parent = CompartmentNode("parent", "platform", None, "ACTIVE", "root")
+        child = CompartmentNode("child", "workloads", None, "ACTIVE", "parent")
+        return {"root": (parent,), "parent": (child,)}
+
+    @staticmethod
+    def _normalize_resource_token(value: str) -> str:
+        return value.replace("_", "-")
+
+    @staticmethod
+    def _sanitize_row_name(value: str) -> str:
+        return value
+
+
+class _BlockerShell:
+    browser = _BlockerBrowser()
+
+    @staticmethod
+    def _effective_region() -> str:
+        return "us-phoenix-1"
+
+    @staticmethod
+    def _namespace_slug(value: str) -> str:
+        return value.replace("_", "-")
 
 
 def test_best_effort_oci_failure_is_explicitly_partial() -> None:
@@ -97,3 +127,31 @@ def test_rm_rejects_ambiguous_or_invalid_arguments(arguments: str) -> None:
     manager = DeletionManager.__new__(DeletionManager)
     with pytest.raises(ValueError):
         manager._parse_rm_args(arguments)
+
+
+def test_vcn_blocker_paths_preserve_cross_compartment_ownership() -> None:
+    manager = DeletionManager(_BlockerShell())
+    current = CompartmentNode("child", "workloads", None, "ACTIVE", "parent")
+    parents = (CompartmentNode("parent", "platform", None, "ACTIVE", "root"),)
+    spec = ResourceSpec("load_balancer", "load_balancers", "", "compartment")
+    row = ResourceRow("public", "ACTIVE", "ocid1.loadbalancer.example")
+
+    assert manager._canonical_blocker_path(spec, row, current, parents) == (
+        "/us-phoenix-1/tenancy/platform/workloads/"
+        "load-balancer/load-balancers/public"
+    )
+
+
+def test_vcn_blocker_scan_includes_every_accessible_compartment() -> None:
+    manager = DeletionManager(_BlockerShell())
+    current = CompartmentNode("child", "workloads", None, "ACTIVE", "parent")
+    scopes, complete = manager._accessible_blocker_scopes(
+        current,
+        (CompartmentNode("parent", "platform", None, "ACTIVE", "root"),),
+    )
+
+    assert complete
+    assert [(node.id, tuple(parent.id for parent in parents)) for node, parents in scopes] == [
+        ("parent", ()),
+        ("child", ("parent",)),
+    ]

@@ -146,9 +146,10 @@ This means a VCN teardown planner cannot assume:
 
 Instead, the planner should treat the VCN OCID as the anchor and discover dependents by reference, not only by compartment.
 
-Practical implication for `ocish`:
+Current `ocish` behavior:
 
 - direct `rm -f` on a VCN should still attempt only the direct `delete_vcn`
-- `rm -r` currently detects same-compartment blockers in the implemented planner
-- cross-compartment blocker discovery remains incomplete and must be treated as a known limitation
-- a plan should clearly label which blockers are in-compartment versus cross-compartment
+- `rm -r` scans all accessible compartments for supported consumers and
+  prints each recognized blocker's canonical path
+- a scan is explicitly marked incomplete if a compartment or supported service
+  cannot be inspected; absence of a blocker is then not a proof of absence

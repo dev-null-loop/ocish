@@ -284,7 +284,10 @@ parent-only or multi-identifier delete APIs remain explicitly unsupported.
 `rm -r` uses the declared child-collection registry for any resource type: it
 previews child deletes first, blocks on an unsupported child, and deletes
 children before their parent on `--apply`. VCNs retain their stricter
-network-specific order and blocker preflight.
+network-specific order and blocker preflight. A VCN plan scans accessible
+compartments for supported external consumers and prints each recognized
+blocker's canonical path; it marks the scan incomplete when a compartment or
+service could not be inspected.
 
 ## Completion
 
