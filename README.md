@@ -68,8 +68,8 @@ and directly navigable resource collections that are present there (for
 example, `core.vcns`). `ll` adds each entry's kind and collection count.
 `identity.compartments` appears only when the compartment has child
 compartments. Domains remain explicit paths: `core`, `dns`, `identity`, `orm`,
-`containerengine`, `generative-ai`, `generative-ai-agent`, `logging`, and
-`load-balancer`, and `network-firewall`.
+`containerengine`, `file-storage`, `generative-ai`, `generative-ai-agent`,
+`logging`, `load-balancer`, and `network-firewall`.
 
 Generative AI resources are compartment-scoped. For example:
 

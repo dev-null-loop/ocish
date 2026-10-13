@@ -150,6 +150,20 @@ class RenderingMixin:
             specs.append(spec)
         return specs
 
+    def _find_domain_specs(self) -> list[ResourceSpec]:
+        """Return every runnable collection in the current service domain.
+
+        Domain-scoped ``find .`` must include collections such as Object
+        Storage buckets that are intentionally not OCI Search types.  The
+        caller requests lister fallback for those declarations.
+        """
+        assert self.namespace_view is not None
+        return [
+            spec
+            for spec in self.browser.resource_specs_for_namespace(self.namespace_view)
+            if spec.runnable
+        ]
+
     def _find_via_search(
         self,
         specs: list[ResourceSpec],

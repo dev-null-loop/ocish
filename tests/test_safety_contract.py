@@ -155,3 +155,23 @@ def test_vcn_blocker_scan_includes_every_accessible_compartment() -> None:
         ("parent", ()),
         ("child", ("parent",)),
     ]
+
+
+def test_find_dot_scopes_to_the_current_service_domain() -> None:
+    shell = main.OciNavShell.__new__(main.OciNavShell)
+    shell.namespace_view = "object_storage"
+    shell.resource_context = None
+    shell.collection_context = None
+    shell.mount_collection = None
+    shell.FIND_RESULT_LIMIT = 100
+    specs = [ResourceSpec("object_storage", "buckets", "", "compartment")]
+    calls: list[object] = []
+    shell._find_domain_specs = lambda: specs
+    shell._find_via_search = lambda selected, pattern, include_lister_results: (
+        calls.append((selected, pattern, include_lister_results)) or []
+    )
+    shell._print_find_results = lambda _results: None
+
+    shell.do_find(".")
+
+    assert calls == [(specs, None, True)]

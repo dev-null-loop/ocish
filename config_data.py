@@ -279,6 +279,47 @@ NAMESPACE_DISCOVERY = {
         "runnable_overrides": {"buckets": True},
         "findable_overrides": {"buckets": False},
     },
+    "file_storage": {
+        "client_map": {
+            "file_storage": "oci.file_storage.FileStorageClient",
+            "file_storage_work_requests": "oci.work_requests.WorkRequestClient",
+        },
+        "endpoint_family": "file-storage",
+        "catalog_discovery": "direct",
+        "adapter_config_overrides": {
+            "export_sets": {"availability_domain_mode": "all"},
+            "file_systems": {"availability_domain_mode": "all"},
+            "filesystem_snapshot_policies": {"availability_domain_mode": "all"},
+            "mount_targets": {"availability_domain_mode": "all"},
+            "outbound_connectors": {"availability_domain_mode": "all"},
+            "replication_targets": {"availability_domain_mode": "all"},
+            "replications": {"availability_domain_mode": "all"},
+        },
+        "runnable_overrides": {
+            "export_sets": True,
+            "file_systems": True,
+            "filesystem_snapshot_policies": True,
+            "mount_targets": True,
+            "outbound_connectors": True,
+            "replication_targets": True,
+            "replications": True,
+        },
+        "findable_overrides": {
+            "exports": False,
+            "export_sets": False,
+            "file_systems": False,
+            "filesystem_snapshot_policies": False,
+            "mount_targets": False,
+            "outbound_connectors": False,
+            "snapshots": False,
+            "quota_rules": False,
+            "replication_targets": False,
+            "replications": False,
+            "work_requests": False,
+            "work_request_errors": False,
+            "work_request_logs": False,
+        },
+    },
     "artifacts": {
         "client_map": {"artifacts": "oci.artifacts.ArtifactsClient"},
         "endpoint_family": "artifacts",
@@ -472,6 +513,9 @@ RESOURCE_CONTEXT_DEFAULTS = {
     "orm.jobs": "job-outputs",
     "orm.stacks": "jobs",
     "orm.work_requests": "work-request-logs",
+    "file_storage.file_systems": "snapshots",
+    "file_storage.mount_targets": "exports",
+    "file_storage.work_requests": "work-request-logs",
 }
 
 RESOURCE_CONTEXT_CHILDREN = {
@@ -1112,6 +1156,30 @@ RESOURCE_CONTEXT_CHILDREN = {
         "work-request-logs": (
             "orm.work-request-logs",
             (("work_request_id", "id"), ("compartment_id", "compartment_id")),
+            None,
+        ),
+    },
+    "file_storage.file_systems": {
+        "exports": (
+            "file_storage.exports",
+            (("file_system_id", "id"),),
+            None,
+        ),
+        "snapshots": (
+            "file_storage.snapshots",
+            (("file_system_id", "id"),),
+            None,
+        ),
+    },
+    "file_storage.work_requests": {
+        "work-request-errors": (
+            "file_storage.work-request-errors",
+            (("work_request_id", "id"),),
+            None,
+        ),
+        "work-request-logs": (
+            "file_storage.work-request-logs",
+            (("work_request_id", "id"),),
             None,
         ),
     },
@@ -2181,4 +2249,9 @@ DIRECT_GETTERS = {
         "get_configuration_source_provider",
     ),
     "ormworkrequest": ("resource_manager", "get_work_request"),
+    "export": ("file_storage", "get_export"),
+    "exportset": ("file_storage", "get_export_set"),
+    "filesystem": ("file_storage", "get_file_system"),
+    "mounttarget": ("file_storage", "get_mount_target"),
+    "snapshot": ("file_storage", "get_snapshot"),
 }

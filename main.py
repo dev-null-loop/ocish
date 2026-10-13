@@ -3558,7 +3558,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                     "  stat [.]                  read the current node's stat record",
                     "  head|tail [-n N] RECORD   read a cached terminal record",
                     "  grep TEXT                 search cached terminal records",
-                    "  find . | TYPE [NAME]     search the current compartment",
+                    "  find . | TYPE [NAME]     search the current compartment or service domain",
                     "  completion [MODE]        show or set completion mode",
                     "  rm [-r] [-f|--apply] PATH  preview or apply deletion",
                     "  exit                     leave the shell",
@@ -3627,7 +3627,7 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                 return
             if self.resource_context is not None or self.collection_context is not None:
                 print(
-                    "find . is available only in a compartment context; use ls or cd .."
+                    "find . is available only in a compartment or service domain; use ls or cd .."
                 )
                 return
             if raw_ocids:
@@ -3638,7 +3638,14 @@ class OciNavShell(RenderingMixin, cmd.Cmd):
                     print(f"OCI Search failed: {exc}")
                 return
             try:
-                results = self._find_current_compartment_paths_via_search()
+                if self.namespace_view is None:
+                    results = self._find_current_compartment_paths_via_search()
+                else:
+                    results = self._find_via_search(
+                        self._find_domain_specs(),
+                        None,
+                        include_lister_results=True,
+                    )
             except Exception as exc:
                 print(exc)
                 return

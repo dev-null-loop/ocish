@@ -19,174 +19,15 @@ from config import (
     NAMESPACE_DISCOVERY,
     NAMESPACE_PATH_SLUGS,
     RESOURCE_ENRICHMENTS,
-    SUPPORT_CLIENTS,
     TIME_QUERY_PROVIDERS,
 )
+from inventory_catalog import ActiveRegionCatalog
+from inventory_adapters_object_storage import ObjectStorageInventoryMixin
+from inventory_adapters_openai import OpenAIInventoryMixin
+from inventory_registry import InventoryRegistryMixin
+from inventory_transport import InventoryTransportMixin
 from models import CompartmentNode, RelationshipTarget, ResourceRow, ResourceSpec
-
-
-class ActiveRegionCatalog:
-    """Refresh active-region resource names off the completion path."""
-
-    REFRESH_SECONDS = 60
-
-    def __init__(self, browser: OciCompartmentBrowser) -> None:
-        self.browser = browser
-        self._lock = threading.Lock()
-        self._wake = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._index_lock = threading.Lock()
-        self._scanned_compartments: set[str] = set()
-        self._requested_compartment: str | None = None
-        self._region: str | None = None
-        self._snapshot: dict[tuple[str, str], tuple[str, ...]] = {}
-        self._id_snapshot: dict[tuple[str, str], tuple[str, ...]] = {}
-        self._resource_snapshot: dict[tuple[str, str], tuple[ResourceRow, ...]] = {}
-        self._children_snapshot: dict[str, tuple[CompartmentNode, ...]] = {}
-        self._collections_snapshot: dict[str, tuple[str, ...]] = {}
-        self._refreshed_at = 0.0
-
-    def start(self) -> None:
-        if self._thread is None:
-            with self._lock:
-                self._requested_compartment = self.browser.current.id
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
-
-    def stop(self) -> None:
-        self._wake.set()
-
-    def refresh_soon(self) -> None:
-        self._wake.set()
-
-    def request_compartment(self, compartment_id: str) -> None:
-        """Refresh completion inventory for the active compartment in the worker."""
-        with self._lock:
-            self._requested_compartment = compartment_id
-        self._wake.set()
-
-    def names_for(self, compartment_id: str, spec: ResourceSpec) -> tuple[str, ...]:
-        with self._lock:
-            if self._region != self.browser.region():
-                return ()
-            return self._snapshot.get((compartment_id, spec.qualified_name), ())
-
-    def ids_for(self, compartment_id: str, spec: ResourceSpec) -> tuple[str, ...]:
-        """Return cached OCI IDs; completion never performs a lookup."""
-        with self._lock:
-            if self._region != self.browser.region():
-                return ()
-            return getattr(self, "_id_snapshot", {}).get(
-                (compartment_id, spec.qualified_name), ()
-            )
-
-    def is_ready(self) -> bool:
-        with self._lock:
-            return self._region == self.browser.region()
-
-    def children_for(self, parent_id: str) -> tuple[CompartmentNode, ...]:
-        with self._lock:
-            if self._region != self.browser.region():
-                return ()
-            return self._children_snapshot.get(parent_id, ())
-
-    def collections_for(self, compartment_id: str) -> tuple[str, ...]:
-        with self._lock:
-            if self._region != self.browser.region():
-                return ()
-            return self._collections_snapshot.get(compartment_id, ())
-
-    def resources_for(
-        self, compartment_id: str, spec: ResourceSpec
-    ) -> tuple[ResourceRow, ...]:
-        with self._lock:
-            if self._region != self.browser.region():
-                return ()
-            return getattr(self, "_resource_snapshot", {}).get(
-                (compartment_id, spec.qualified_name), ()
-            )
-
-    def status(self) -> dict[str, object]:
-        with self._lock:
-            return {
-                "region": self._region,
-                "refreshed_at": self._refreshed_at,
-                "collections": len(self._snapshot),
-            }
-
-    def _run(self) -> None:
-        while True:
-            region = self.browser.region()
-            try:
-                children = self.browser.build_active_region_compartment_catalog()
-            except oci.exceptions.ServiceError:
-                children = None
-            if children is not None and region == self.browser.region():
-                with self._lock:
-                    self._region = region
-                    self._children_snapshot = children
-                    self._snapshot = {}
-                    self._id_snapshot = {}
-                    self._resource_snapshot = {}
-                    self._collections_snapshot = {}
-                    self._refreshed_at = time.monotonic()
-                    self._scanned_compartments = set()
-                    compartment_id = self._requested_compartment
-                if compartment_id is not None:
-                    self.prime_compartment(compartment_id)
-            self._wake.wait(self.REFRESH_SECONDS)
-            if self._wake.is_set():
-                self._wake.clear()
-
-    def _publish_resources(
-        self,
-        region: str,
-        snapshot: dict[tuple[str, str], tuple[str, ...]],
-        ids: dict[tuple[str, str], tuple[str, ...]],
-        rows: dict[tuple[str, str], tuple[ResourceRow, ...]],
-    ) -> None:
-        collections: dict[str, set[str]] = {}
-        for compartment_id, qualified_name in snapshot:
-            collections.setdefault(compartment_id, set()).add(qualified_name)
-        with self._lock:
-            if self._region != region or region != self.browser.region():
-                return
-            self._snapshot = snapshot
-            self._id_snapshot = ids
-            self._resource_snapshot = rows
-            self._collections_snapshot = {
-                key: tuple(sorted(value)) for key, value in collections.items()
-            }
-            self._refreshed_at = time.monotonic()
-
-    def prime_compartment(self, compartment_id: str) -> None:
-        """Populate one compartment's completion inventory when explicitly scheduled."""
-        with self._index_lock:
-            with self._lock:
-                if (
-                    self._region != self.browser.region()
-                    or compartment_id in self._scanned_compartments
-                ):
-                    return
-            try:
-                snapshot = self.browser.build_active_region_catalog(
-                    compartment_id=compartment_id
-                )
-            except oci.exceptions.ServiceError:
-                return
-            ids = dict(getattr(self.browser, "active_region_catalog_ids", {}))
-            rows = dict(getattr(self.browser, "active_region_catalog_rows", {}))
-            with self._lock:
-                merged = {**self._snapshot, **snapshot}
-                merged_ids = {**self._id_snapshot, **ids}
-                merged_rows = {**self._resource_snapshot, **rows}
-                self._scanned_compartments.add(compartment_id)
-            self._publish_resources(
-                self.browser.region(), merged, merged_ids, merged_rows
-            )
-
-
-class OciCompartmentBrowser:
+class OciCompartmentBrowser(ObjectStorageInventoryMixin, OpenAIInventoryMixin, InventoryTransportMixin, InventoryRegistryMixin):
     THROTTLE_RETRIES = 5
     THROTTLE_BASE_DELAY = 0.5
     PROJECTION_CACHE_TTL_SECONDS = 30.0
@@ -253,20 +94,6 @@ class OciCompartmentBrowser:
             module_name, class_name = class_path.rsplit(".", 1)
             client_class = getattr(importlib.import_module(module_name), class_name)
             setattr(self, attribute, client_class(self.config))
-
-    @staticmethod
-    def _declared_client_classes() -> dict[str, str]:
-        """Return the complete, conflict-free OCI client registry."""
-        clients = dict(SUPPORT_CLIENTS)
-        for namespace, config in NAMESPACE_DISCOVERY.items():
-            for key in ("client_map", "support_client_map"):
-                for attribute, class_path in dict(config.get(key, {})).items():
-                    existing = clients.setdefault(str(attribute), str(class_path))
-                    if existing != class_path:
-                        raise ValueError(
-                            f"conflicting client declaration for {attribute} in {namespace}"
-                        )
-        return clients
 
     def region(self) -> str:
         return str(self.config.get("region", "-"))
@@ -522,10 +349,21 @@ class OciCompartmentBrowser:
                 name = payload.get("display_name") or payload.get("name")
                 identifier = payload.get("identifier") or payload.get("id")
                 resource_type = payload.get("resource_type")
+                row = ResourceRow(
+                    name=self._humanize_name(name or identifier or "<unnamed>"),
+                    state=str(payload.get("lifecycle_state") or "-"),
+                    id=str(identifier or name or ""),
+                    details={
+                        "compartment_id": str(item_compartment_id or "-"),
+                        "resource_type": str(resource_type or "-"),
+                    },
+                    payload=payload,
+                )
                 if spec is not None and isinstance(resource_type, str):
                     previous = self.search_type_cache.get(spec.qualified_name)
                     if previous is None or len(resource_type) > len(previous):
                         self.search_type_cache[spec.qualified_name] = resource_type
+                    spec = self.canonical_spec_for_search_row(spec, row)
                 if (
                     spec is None
                     or not self._is_public_resource_spec(spec)
@@ -543,14 +381,7 @@ class OciCompartmentBrowser:
                     ).add(identifier)
                     rows.setdefault(
                         (item_compartment_id, spec.qualified_name), []
-                    ).append(
-                        ResourceRow(
-                            name=self._humanize_name(name),
-                            state=str(payload.get("lifecycle_state") or "-"),
-                            id=identifier,
-                            payload=payload,
-                        )
-                    )
+                    ).append(row)
             if on_snapshot is not None:
                 on_snapshot(*snapshot())
             page = getattr(response, "next_page", None)
@@ -775,6 +606,22 @@ class OciCompartmentBrowser:
                 spec = self._resource_spec_for_search_type(payload.get("resource_type"))
                 if spec is None or not self._is_public_resource_spec(spec):
                     continue
+                row = ResourceRow(
+                    name=self._humanize_name(
+                        payload.get("display_name")
+                        or payload.get("name")
+                        or payload.get("identifier")
+                        or "<unnamed>"
+                    ),
+                    state=str(payload.get("lifecycle_state") or "-"),
+                    id=str(payload.get("identifier") or payload.get("id") or ""),
+                    details={
+                        "compartment_id": str(payload.get("compartment_id") or "-"),
+                        "resource_type": str(payload.get("resource_type") or "-"),
+                    },
+                    payload=payload,
+                )
+                spec = self.canonical_spec_for_search_row(spec, row)
                 specs[spec.qualified_name] = spec
                 counts[spec.qualified_name] = counts.get(spec.qualified_name, 0) + 1
             page = getattr(response, "opc_next_page", None)
@@ -1152,156 +999,6 @@ class OciCompartmentBrowser:
             "truncated": bool(next_token),
         }
 
-    def _object_storage_namespace(self) -> str:
-        try:
-            return str(self._retry_oci_call(self.object_storage.get_namespace).data)
-        except Exception as exc:
-            raise ValueError(f"object storage namespace unavailable: {exc}") from exc
-
-    def _list_object_storage_buckets(
-        self, _kwargs: dict[str, object]
-    ) -> list[ResourceRow]:
-        namespace = self._object_storage_namespace()
-        try:
-            response = self._retry_oci_call(
-                oci.pagination.list_call_get_all_results,
-                self.object_storage.list_buckets,
-                namespace,
-                self.current.id,
-            )
-        except Exception as exc:
-            raise ValueError(f"object storage buckets unavailable: {exc}") from exc
-        rows: list[ResourceRow] = []
-        for item in self._collection_items(response.data):
-            payload = oci.util.to_dict(item)
-            name = str(payload.get("name") or "bucket")
-            rows.append(
-                ResourceRow(
-                    name=name,
-                    state=str(payload.get("public_access_type") or "-"),
-                    id=f"bucket:{namespace}:{name}",
-                    payload=payload,
-                    details={"namespace": namespace, "bucket_name": name},
-                )
-            )
-        return rows
-
-    def list_object_prefix(
-        self, bucket: ResourceRow, prefix: str = ""
-    ) -> list[ResourceRow]:
-        """List one Object Storage pseudo-directory without downloading bodies."""
-        namespace = str(
-            (bucket.details or {}).get("namespace") or self._object_storage_namespace()
-        )
-        bucket_name = str((bucket.details or {}).get("bucket_name") or bucket.name)
-        try:
-            response: object | None = None
-            objects: list[object] = []
-            prefixes: set[str] = set()
-            start: str | None = None
-            for _page in range(self.OBJECT_LIST_MAX_PAGES):
-                kwargs: dict[str, object] = {
-                    "prefix": prefix,
-                    "delimiter": "/",
-                    "limit": 1000,
-                }
-                if start:
-                    kwargs["start"] = start
-                response = self._retry_oci_call(
-                    self.object_storage.list_objects, namespace, bucket_name, **kwargs
-                )
-                data = getattr(response, "data", response)
-                objects.extend(getattr(data, "objects", []) or [])
-                prefixes.update(
-                    str(item) for item in (getattr(data, "prefixes", []) or [])
-                )
-                start = getattr(data, "next_start_with", None)
-                if not start:
-                    break
-            if start:
-                raise ValueError(
-                    f"object listing exceeds {self.OBJECT_LIST_MAX_PAGES * 1000} entries; descend into a prefix"
-                )
-        except Exception as exc:
-            raise ValueError(f"object storage objects unavailable: {exc}") from exc
-        rows: list[ResourceRow] = []
-        for common_prefix in prefixes:
-            child_prefix = str(common_prefix)
-            label = child_prefix[len(prefix) :].rstrip("/") or child_prefix.rstrip("/")
-            rows.append(
-                ResourceRow(
-                    name=label,
-                    state="directory",
-                    id=f"prefix:{child_prefix}",
-                    details={"object_prefix": child_prefix, "object_directory": "true"},
-                    payload={"prefix": child_prefix},
-                )
-            )
-        for item in objects:
-            payload = oci.util.to_dict(item)
-            object_name = str(payload.get("name") or "object")
-            label = object_name.removeprefix(prefix)
-            rows.append(
-                ResourceRow(
-                    name=label,
-                    state=str(payload.get("storage_tier") or "-"),
-                    id=f"object:{namespace}:{bucket_name}:{object_name}",
-                    payload=payload,
-                    details={
-                        "namespace": namespace,
-                        "bucket_name": bucket_name,
-                        "object_name": object_name,
-                    },
-                )
-            )
-        return sorted(
-            rows, key=lambda row: (row.state != "directory", row.name.casefold())
-        )
-
-    def read_object_content(self, object_row: ResourceRow) -> str:
-        """Read only small, declared-text Object Storage bodies."""
-        details = object_row.details or {}
-        namespace = str(details["namespace"])
-        bucket = str(details["bucket_name"])
-        name = str(details["object_name"])
-        response = self._retry_oci_call(
-            self.object_storage.get_object, namespace, bucket, name
-        )
-        headers = getattr(response, "headers", {}) or {}
-        length = int(
-            headers.get("content-length", headers.get("Content-Length", 0)) or 0
-        )
-        content_type = str(
-            headers.get("content-type", headers.get("Content-Type", ""))
-        ).lower()
-        if length > self.CONTENT_MAX_BYTES:
-            raise ValueError(
-                f"object content is {length} bytes; maximum readable size is {self.CONTENT_MAX_BYTES}"
-            )
-        if content_type and not (
-            content_type.startswith("text/")
-            or "json" in content_type
-            or "xml" in content_type
-        ):
-            raise ValueError(
-                f"object content type {content_type} is not text; inspect metadata instead"
-            )
-        raw = getattr(getattr(response, "data", None), "content", None)
-        if raw is None:
-            raw = getattr(getattr(response, "data", None), "raw", None)
-            raw = raw.read(self.CONTENT_MAX_BYTES + 1) if raw is not None else b""
-        if isinstance(raw, str):
-            return raw
-        if len(raw) > self.CONTENT_MAX_BYTES:
-            raise ValueError(
-                f"object content exceeds maximum readable size of {self.CONTENT_MAX_BYTES}"
-            )
-        try:
-            return raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(
-                "object content is not UTF-8 text; inspect metadata instead"
-            ) from exc
 
     def resolve_resource_row(
         self,
@@ -1326,9 +1023,7 @@ class OciCompartmentBrowser:
         if target is None:
             raise ValueError(f"{spec.qualified_name} not found: {ocid}")
         if target.spec is None or target.spec.qualified_name != spec.qualified_name:
-            actual = (
-                target.spec.qualified_name if target.spec is not None else "unknown"
-            )
+            actual = target.spec.qualified_name if target.spec is not None else "unknown"
             raise ValueError(f"{ocid} is {actual}, not {spec.qualified_name}")
         return target
 
@@ -1349,21 +1044,17 @@ class OciCompartmentBrowser:
     def canonical_spec_for_search_row(
         self, spec: ResourceSpec, row: ResourceRow
     ) -> ResourceSpec:
-        """Resolve registry-declared ownership variants in ambiguous Search types."""
         config = dict(spec.adapter_config)
         field = config.get("canonical_search_field")
         owned_type = config.get("canonical_search_owned")
         catalog_type = config.get("canonical_search_catalog")
-        if not all(
-            isinstance(value, str) for value in (field, owned_type, catalog_type)
-        ):
+        if not all(isinstance(value, str) for value in (field, owned_type, catalog_type)):
             return spec
-        hydrated = self.hydrate_resource_row(row)
-        value = (hydrated.details or {}).get(field)
+        value = (row.details or {}).get(field)
+        if value is None:
+            value = (self.hydrate_resource_row(row).details or {}).get(field)
         if value in (None, "", "-", "None", self.tenancy_id):
-            return self.resolve_resource_spec(
-                self._qualified_variant(spec, catalog_type)
-            )
+            return self.resolve_resource_spec(self._qualified_variant(spec, catalog_type))
         return self.resolve_resource_spec(self._qualified_variant(spec, owned_type))
 
     @staticmethod
@@ -1371,180 +1062,6 @@ class OciCompartmentBrowser:
         if "." in resource_type:
             return resource_type
         return f"{spec.namespace}.{resource_type}"
-
-    def _build_resource_specs(self) -> list[ResourceSpec]:
-        specs: list[ResourceSpec] = []
-        for namespace, config in NAMESPACE_DISCOVERY.items():
-            specs.extend(self._build_namespace_resource_specs(namespace, config))
-        return sorted(specs, key=lambda spec: (spec.namespace, spec.name))
-
-    def _build_namespace_resource_specs(
-        self, namespace: str, config: dict[str, object]
-    ) -> list[ResourceSpec]:
-        endpoint_family = str(config["endpoint_family"])
-        client_map = config.get("client_map", {})
-        custom_listers = dict(config.get("custom_listers", {}))
-        resource_name_overrides = dict(config.get("resource_name_overrides", {}))
-        scope_overrides = dict(config.get("scope_overrides", {}))
-        runnable_overrides = dict(config.get("runnable_overrides", {}))
-        findable_overrides = dict(config.get("findable_overrides", {}))
-        search_type_overrides = dict(config.get("search_type_overrides", {}))
-        node_capability_overrides = dict(config.get("node_capability_overrides", {}))
-        adapter_config_overrides = dict(config.get("adapter_config_overrides", {}))
-        adapter_kind = str(config.get("adapter_kind", "resource-tree"))
-        specs: list[ResourceSpec] = []
-        seen: set[str] = set()
-        for client_attr, class_name in dict(client_map).items():
-            module_name, client_name = str(class_name).rsplit(".", 1)
-            client_cls = getattr(importlib.import_module(module_name), client_name)
-            for method_name, method in inspect.getmembers(
-                client_cls, inspect.isfunction
-            ):
-                if not method_name.startswith("list_"):
-                    continue
-                source_resource_name = method_name.removeprefix("list_")
-                resource_name = str(
-                    resource_name_overrides.get(
-                        source_resource_name, source_resource_name
-                    )
-                )
-                if resource_name in seen:
-                    continue
-                seen.add(resource_name)
-                required_params = self._required_param_names(method)
-                accepted_params = self._accepted_param_names(method)
-                scope, runnable = self._infer_scope(required_params, accepted_params)
-                runnable = bool(runnable_overrides.get(source_resource_name, runnable))
-                scope = str(scope_overrides.get(source_resource_name, scope))
-                specs.append(
-                    ResourceSpec(
-                        namespace=namespace,
-                        name=resource_name,
-                        endpoint_family=endpoint_family,
-                        scope=scope,
-                        lister_name=custom_listers.get(source_resource_name),
-                        client_attr=str(client_attr),
-                        client_name=client_cls.__name__,
-                        list_operation=method_name,
-                        required_params=tuple(required_params),
-                        accepted_params=tuple(accepted_params),
-                        runnable=runnable,
-                        findable=bool(
-                            findable_overrides.get(
-                                source_resource_name,
-                                runnable and scope.startswith("compartment"),
-                            )
-                        ),
-                        search_type=search_type_overrides.get(source_resource_name),
-                        node_capability=node_capability_overrides.get(
-                            source_resource_name, "navigable-resource"
-                        ),
-                        adapter_kind=adapter_kind,
-                        adapter_config=tuple(
-                            sorted(
-                                dict(
-                                    adapter_config_overrides.get(
-                                        source_resource_name, {}
-                                    )
-                                ).items()
-                            )
-                        ),
-                    )
-                )
-        for extra in config.get("extra_specs", []):
-            extra_spec = dict(extra)
-            specs.append(
-                ResourceSpec(
-                    namespace=namespace,
-                    name=str(extra_spec["name"]),
-                    endpoint_family=str(extra_spec["endpoint_family"]),
-                    scope=str(extra_spec["scope"]),
-                    lister_name=extra_spec.get("lister_name"),
-                    client_attr=extra_spec.get("client_attr"),
-                    client_name=extra_spec.get("client_name"),
-                    list_operation=extra_spec.get("list_operation"),
-                    required_params=tuple(extra_spec.get("required_params", ())),
-                    accepted_params=tuple(extra_spec.get("accepted_params", ())),
-                    runnable=bool(extra_spec.get("runnable", True)),
-                    findable=bool(
-                        extra_spec.get("findable", extra_spec.get("runnable", True))
-                    ),
-                    search_type=extra_spec.get("search_type"),
-                    node_capability=str(
-                        extra_spec.get("node_capability", "navigable-resource")
-                    ),
-                    adapter_kind=str(extra_spec.get("adapter_kind", adapter_kind)),
-                    adapter_config=tuple(
-                        sorted(dict(extra_spec.get("adapter_config", {})).items())
-                    ),
-                )
-            )
-        return sorted(specs, key=lambda spec: spec.name)
-
-    @staticmethod
-    def _required_param_names(method: object) -> list[str]:
-        sig = inspect.signature(method)
-        required: list[str] = []
-        for param in sig.parameters.values():
-            if param.name == "self":
-                continue
-            if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
-                continue
-            if param.default is inspect._empty:
-                required.append(param.name)
-        return required
-
-    @staticmethod
-    def _accepted_param_names(method: object) -> list[str]:
-        sig = inspect.signature(method)
-        explicit = [
-            param.name
-            for param in sig.parameters.values()
-            if param.name != "self"
-            and param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
-        ]
-        if explicit:
-            return explicit
-        doc = getattr(method, "__doc__", "") or ""
-        seen: list[str] = []
-        for name in re.findall(r":param\s+[^:]+\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:", doc):
-            if name not in seen:
-                seen.append(name)
-        return seen
-
-    @staticmethod
-    def _infer_scope(
-        required_params: list[str], accepted_params: list[str]
-    ) -> tuple[str, bool]:
-        required = set(required_params)
-        if not required_params:
-            accepted = set(accepted_params)
-            if "compartment_id" in accepted:
-                if "scope" in accepted:
-                    return "compartment+scope", True
-                return "compartment(filtered)", True
-            if any(
-                OciCompartmentBrowser._is_resource_reference_param(name)
-                for name in accepted_params
-            ):
-                return "parent-resource", False
-            return "region", True
-        if required == {"compartment_id"}:
-            return "compartment", True
-        if required == {"scope", "compartment_id"}:
-            return "compartment+scope", True
-        if "compartment_id" in required:
-            return "compartment+extra", False
-        if any(
-            OciCompartmentBrowser._is_resource_reference_param(name)
-            for name in required_params
-        ):
-            return "parent-resource", False
-        return "special", False
-
-    @staticmethod
-    def _is_resource_reference_param(name: str) -> bool:
-        return name.endswith("_id") and not name.startswith("opc_")
 
     def _direct_catalog_resources(
         self, compartment_id: str
@@ -1583,6 +1100,7 @@ class OciCompartmentBrowser:
         client = getattr(self, spec.client_attr)
         operation = getattr(client, spec.list_operation)
         kwargs = {}
+        adapter_config = dict(spec.adapter_config)
         accepted = set(spec.accepted_params or spec.required_params)
         if "compartment_id" in accepted:
             kwargs["compartment_id"] = compartment_id or self.current.id
@@ -1590,123 +1108,32 @@ class OciCompartmentBrowser:
             kwargs["scope"] = "REGION"
         if extra_kwargs:
             kwargs.update(extra_kwargs)
-        response_data = self._retry_oci_call(
-            oci.pagination.list_call_get_all_results, operation, **kwargs
-        ).data
-        items = self._collection_items(response_data)
+        availability_domains: tuple[str | None, ...] = (None,)
+        if (
+            adapter_config.get("availability_domain_mode") == "all"
+            and "availability_domain" in accepted
+        ):
+            response = self._retry_oci_call(
+                oci.pagination.list_call_get_all_results,
+                self.identity.list_availability_domains,
+                self.tenancy_id,
+            )
+            availability_domains = tuple(
+                str(getattr(domain, "name", ""))
+                for domain in self._collection_items(response.data)
+                if getattr(domain, "name", None)
+            )
+        items: list[object] = []
+        for availability_domain in availability_domains:
+            call_kwargs = dict(kwargs)
+            if availability_domain is not None:
+                call_kwargs["availability_domain"] = availability_domain
+            response_data = self._retry_oci_call(
+                oci.pagination.list_call_get_all_results, operation, **call_kwargs
+            ).data
+            items.extend(self._collection_items(response_data))
         rows = [self._row_from_oci_item(item) for item in items]
-        return sorted(rows, key=lambda row: row.name.lower())
-
-    def _list_openai_project_data(
-        self, kwargs: dict[str, object], spec: ResourceSpec
-    ) -> list[ResourceRow]:
-        config = {
-            **dict(NAMESPACE_DISCOVERY[spec.namespace].get("openai_data", {})),
-            **dict(spec.adapter_config),
-        }
-        project_key = config["project_param"]
-        project_id = kwargs.get(project_key)
-        if not isinstance(project_id, str) or not project_id:
-            raise ValueError(f"{project_key} is required")
-        request = {"limit": 100}
-        parent_key = config.get("parent_param")
-        if parent_key:
-            parent_id = kwargs.get(parent_key)
-            if not isinstance(parent_id, str) or not parent_id:
-                raise ValueError(f"{parent_key} is required")
-            request[parent_key] = parent_id
-        payloads = self._list_openai_collection(
-            self._openai_project_client(project_id, config),
-            config["collection"],
-            request,
-            int(config["max_pages"]),
-        )
-        return sorted(
-            [
-                self._row_from_openai_data_item(payload, project_id)
-                for payload in payloads
-            ],
-            key=lambda row: row.name.lower(),
-        )
-
-    def _openai_project_client(
-        self, project_id: str, config: dict[str, str]
-    ) -> object:
-        from openai import OpenAI
-
-        base_url = config["base_url"].format(region=self.region())
-        api_key = next(
-            (os.getenv(name) for name in config["api_key_env"].split(",") if os.getenv(name)),
-            None,
-        )
-        if api_key:
-            return OpenAI(base_url=base_url, api_key=api_key, project=project_id)
-        try:
-            import httpx
-            from oci_genai_auth import OciSessionAuth, OciUserPrincipalAuth
-        except ImportError as exc:
-            raise RuntimeError(config["auth_error"]) from exc
-        try:
-            auth = OciSessionAuth(profile_name=self.profile_name or "DEFAULT")
-        except KeyError:
-            auth = OciUserPrincipalAuth(profile_name=self.profile_name or "DEFAULT")
-        return OpenAI(
-            base_url=base_url,
-            api_key="not-used",
-            project=project_id,
-            http_client=httpx.Client(auth=auth),
-        )
-
-    @staticmethod
-    def _list_openai_collection(
-        client: object,
-        collection: str,
-        parameters: dict[str, object],
-        max_pages: int,
-    ) -> list[dict[str, object]]:
-        """Read any dotted collection from an OpenAI-compatible client."""
-        target: object = client
-        for part in collection.split("."):
-            target = getattr(target, part)
-        try:
-            page = target.list(**parameters)
-        except Exception as exc:
-            if exc.__class__.__name__ == "NotFoundError":
-                return []
-            raise
-        items: list[dict[str, object]] = []
-        for _ in range(max_pages):
-            items.extend(self._openai_item_dict(item) for item in page.data)
-            if not page.has_next_page():
-                break
-            page = page.get_next_page()
-        return items
-
-    @staticmethod
-    def _openai_item_dict(item: object) -> dict[str, object]:
-        if hasattr(item, "model_dump"):
-            return dict(item.model_dump())
-        if isinstance(item, dict):
-            return dict(item)
-        return dict(vars(item))
-
-    def _row_from_openai_data_item(
-        self, payload: dict[str, object], project_id: str
-    ) -> ResourceRow:
-        name = str(
-            payload.get("filename")
-            or payload.get("name")
-            or payload.get("id")
-            or "<unnamed>"
-        )
-        return ResourceRow(
-            name=name,
-            state=str(payload.get("status") or "-"),
-            id=str(payload.get("id") or name),
-            extra=str(payload.get("purpose") or ""),
-            details={**payload, "generative_ai_project_id": project_id},
-            payload={**payload, "generative_ai_project_id": project_id},
-        )
+        return sorted({row.id: row for row in rows}.values(), key=lambda row: row.name.lower())
 
     @staticmethod
     def _search_type_for(spec: ResourceSpec) -> str:
@@ -2284,73 +1711,6 @@ class OciCompartmentBrowser:
             if (source_id := self._log_source_resource_id(row)) is not None
             and resource_id in self._log_source_related_ids(source_id)
         ]
-
-    @staticmethod
-    def _is_throttling_error(exc: Exception) -> bool:
-        return isinstance(exc, oci.exceptions.ServiceError) and exc.status == 429
-
-    def _retry_oci_call(
-        self, func: Callable[..., object], *args: object, **kwargs: object
-    ) -> object:
-        delay = self.THROTTLE_BASE_DELAY
-        for attempt in range(self.THROTTLE_RETRIES + 1):
-            try:
-                return func(*args, **kwargs)
-            except Exception as exc:
-                if (
-                    not self._is_throttling_error(exc)
-                    or attempt >= self.THROTTLE_RETRIES
-                ):
-                    self._record_oci_failure(func, exc)
-                    raise
-                time.sleep(delay)
-                delay *= 2
-        raise RuntimeError("unreachable")
-
-    def _record_oci_failure(self, func: Callable[..., object], exc: Exception) -> None:
-        self._record_failure(
-            getattr(func, "__name__", type(func).__name__), exc, state="error"
-        )
-
-    def record_partial_failure(self, operation: str, exc: Exception) -> None:
-        """Record a skipped optional OCI read for the current stat envelope."""
-        self._record_failure(operation, exc, state="partial")
-
-    def _record_failure(self, operation: str, exc: Exception, *, state: str) -> None:
-        status = getattr(exc, "status", None)
-        code = getattr(exc, "code", None)
-        message = str(getattr(exc, "message", None) or exc)
-        normalized = message.casefold()
-        kind = "error"
-        if status in {401, 403}:
-            kind = "permission-denied"
-        elif "not subscribed" in normalized:
-            kind = "region-not-subscribed"
-        elif status == 404 or "not available" in normalized:
-            kind = "service-unavailable"
-        elif status == 429:
-            kind = "throttled"
-        self.last_oci_failure = {
-            "state": state,
-            "kind": kind,
-            "operation": operation,
-            "status": status,
-            "code": code,
-            "message": message,
-            "request_id": getattr(exc, "request_id", None),
-            "timestamp": datetime.now(UTC).isoformat(),
-        }
-
-    @staticmethod
-    def _collection_items(value: object) -> list[object]:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return value
-        items = getattr(value, "items", None)
-        if isinstance(items, list):
-            return items
-        return [value]
 
     def _row_from_oci_item(self, item: object) -> ResourceRow:
         name = (

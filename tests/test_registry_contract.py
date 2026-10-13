@@ -7,7 +7,15 @@ import pytest
 
 from config import RESOURCE_CONTEXT_CHILDREN, SUPPORT_CLIENTS, TOPOLOGY_EDGES
 from inventory import OciCompartmentBrowser
-from models import ResourceChildCollection, ResourceRow, ResourceSpec
+from models import (
+    CompartmentNode,
+    RelationshipTarget,
+    ResourceChildCollection,
+    ResourceContext,
+    ResourceRow,
+    ResourceSpec,
+)
+from relationships import RelationshipNamespace
 
 
 def _child_resource_type(child: object) -> str:
@@ -41,6 +49,73 @@ def test_declared_oci_clients_are_importable() -> None:
     for class_path in clients.values():
         module_name, class_name = class_path.rsplit(".", 1)
         assert getattr(importlib.import_module(module_name), class_name)
+
+
+def test_file_storage_registry_exposes_required_read_only_collections(browser) -> None:
+    expected = {
+        "file_storage.file_systems",
+        "file_storage.mount_targets",
+        "file_storage.exports",
+        "file_storage.snapshots",
+        "file_storage.work_requests",
+        "file_storage.work_request_errors",
+        "file_storage.work_request_logs",
+    }
+
+    assert expected <= {spec.qualified_name for spec in browser.resource_specs}
+    file_systems = browser.resolve_resource_spec("file_storage.file_systems")
+    assert file_systems.runnable
+    assert dict(file_systems.adapter_config)["availability_domain_mode"] == "all"
+
+
+def test_availability_domain_adapter_lists_file_storage_in_every_domain(
+    browser, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Response:
+        def __init__(self, data: object) -> None:
+            self.data = data
+
+    class Identity:
+        @staticmethod
+        def list_availability_domains(_tenancy_id: str) -> object:
+            raise AssertionError("pagination wrapper should intercept this call")
+
+    class FileStorage:
+        @staticmethod
+        def list_file_systems(**_kwargs: object) -> object:
+            raise AssertionError("pagination wrapper should intercept this call")
+
+    calls: list[dict[str, object]] = []
+
+    def paginate(operation: object, *args: object, **kwargs: object) -> Response:
+        if operation is browser.identity.list_availability_domains:
+            assert args == (browser.tenancy_id,)
+            return Response(
+                [
+                    type("AvailabilityDomain", (), {"name": "AD-1"})(),
+                    type("AvailabilityDomain", (), {"name": "AD-2"})(),
+                ]
+            )
+        assert operation is browser.file_storage.list_file_systems
+        calls.append(dict(kwargs))
+        return Response([])
+
+    browser.current = CompartmentNode("compartment", "app", None, "ACTIVE", None)
+    browser.tenancy_id = "ocid1.tenancy.oc1..example"
+    browser.identity = Identity()
+    browser.file_storage = FileStorage()
+    browser._retry_oci_call = lambda func, *args, **kwargs: func(*args, **kwargs)
+    browser._row_from_oci_item = lambda item: item
+    monkeypatch.setattr("inventory.oci.pagination.list_call_get_all_results", paginate)
+
+    browser._list_generic_resource(
+        browser.resolve_resource_spec("file_storage.file_systems")
+    )
+
+    assert calls == [
+        {"compartment_id": "compartment", "availability_domain": "AD-1"},
+        {"compartment_id": "compartment", "availability_domain": "AD-2"},
+    ]
 
 
 def test_client_rebuild_uses_declared_registry(
@@ -136,3 +211,90 @@ def test_search_canonicalization_is_registry_declared(
 
     assert dict(spec.adapter_config)["canonical_search_field"] == "compartment_id"
     assert browser.canonical_spec_for_search_row(spec, row).qualified_name == expected
+
+
+def test_compartment_image_discovery_uses_the_custom_images_collection(
+    browser, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image = type(
+        "SearchImage",
+        (),
+        {
+            "resource_type": "Image",
+            "compartment_id": "ocid1.compartment.oc1..owned",
+            "display_name": "golden-image",
+            "identifier": "ocid1.image.oc1..golden",
+            "lifecycle_state": "AVAILABLE",
+        },
+    )()
+
+    class Response:
+        data = type("Data", (), {"items": [image], "opc_next_page": None})()
+
+    browser.current = CompartmentNode("owned", "app", None, "ACTIVE", None)
+    browser.config = {"region": "eu-frankfurt-1"}
+    browser.tenancy_id = "ocid1.tenancy.oc1..tenant"
+    browser.resource_search = type("ResourceSearch", (), {"search_resources": object()})()
+    browser.search_type_cache = {}
+    browser._retry_oci_call = lambda *_args, **_kwargs: Response()
+    browser._direct_catalog_resources = lambda _compartment_id: []
+    monkeypatch.setattr(
+        "inventory.oci.util.to_dict",
+        lambda item: {
+            "resource_type": item.resource_type,
+            "compartment_id": item.compartment_id,
+            "display_name": item.display_name,
+            "identifier": item.identifier,
+            "lifecycle_state": item.lifecycle_state,
+        },
+    )
+
+    discovered = browser.list_current_compartment_resource_types()
+
+    assert [(spec.qualified_name, count) for spec, count in discovered] == [
+        ("core.custom-images", 1)
+    ]
+
+
+def test_declared_topology_edge_becomes_a_canonical_relationship() -> None:
+    cluster_spec = ResourceSpec("containerengine", "clusters", "", "compartment")
+    subnet_spec = ResourceSpec("core", "subnets", "", "compartment")
+    subnet_row = ResourceRow("api-subnet", "AVAILABLE", "ocid1.subnet.oc1..api")
+    target = RelationshipTarget(subnet_spec, subnet_row, "ocid1.compartment.oc1..app")
+
+    class Browser:
+        @staticmethod
+        def resolve_resource_spec(resource_type: str) -> ResourceSpec:
+            assert resource_type == "core.subnets"
+            return subnet_spec
+
+        @staticmethod
+        def resolve_resource_id(spec: ResourceSpec, ocid: str) -> RelationshipTarget:
+            assert spec == subnet_spec
+            assert ocid == subnet_row.id
+            return target
+
+        @staticmethod
+        def relationship_target(_ocid: str) -> None:
+            return None
+
+        @staticmethod
+        def record_partial_failure(_operation: str, _exc: Exception) -> None:
+            raise AssertionError("declared relationship resolution should succeed")
+
+    class Shell:
+        browser = Browser()
+
+    cluster = ResourceContext(
+        cluster_spec,
+        ResourceRow(
+            "prod-oke",
+            "ACTIVE",
+            "ocid1.cluster.oc1..prod",
+            payload={"endpoint_config": {"subnet_id": subnet_row.id}},
+        ),
+    )
+
+    assert RelationshipNamespace(Shell()).direct(cluster.row.payload, cluster) == [
+        ("api-endpoint", target)
+    ]

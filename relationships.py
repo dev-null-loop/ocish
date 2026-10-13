@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING
 
 import oci
 
-from config import INDIRECT_RELATIONSHIP_POLICIES, RELATIONSHIP_PROVENANCE_RULES
+from config import (
+    INDIRECT_RELATIONSHIP_POLICIES,
+    RELATIONSHIP_PROVENANCE_RULES,
+    TOPOLOGY_EDGES,
+)
 from models import RelationshipTarget, ResourceContext
 
 if TYPE_CHECKING:
@@ -80,10 +84,69 @@ class RelationshipNamespace:
             compartment_id=self.shell.browser.current.id,
         )
 
+    @staticmethod
+    def _payload_value(payload: object, field: str) -> object | None:
+        """Read one registry-declared dotted field without guessing structure."""
+        value = payload
+        for part in field.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
+
+    @staticmethod
+    def _ocid_values(value: object) -> tuple[str, ...]:
+        if isinstance(value, str) and value.startswith("ocid1."):
+            return (value,)
+        if isinstance(value, list):
+            return tuple(
+                item
+                for item in value
+                if isinstance(item, str) and item.startswith("ocid1.")
+            )
+        return ()
+
+    def _declared_direct(
+        self, resource: ResourceContext
+    ) -> list[tuple[str, RelationshipTarget]]:
+        """Resolve direct topology declarations as canonical relationships.
+
+        The topology registry is the service-specific source of truth.  Reusing
+        its direct edges here avoids per-service relationship branches while
+        retaining reliable labels for nested fields and OCID arrays.
+        """
+        references: list[tuple[str, RelationshipTarget]] = []
+        payload = resource.row.payload or {}
+        for edge in TOPOLOGY_EDGES.get(resource.spec.qualified_name, ()):
+            if edge.get("kind") != "direct":
+                continue
+            field = edge.get("field")
+            target_type = edge.get("target")
+            if not isinstance(field, str) or not isinstance(target_type, str):
+                continue
+            try:
+                target_spec = self.shell.browser.resolve_resource_spec(target_type)
+            except ValueError:
+                continue
+            label = str(edge.get("role") or field.rsplit(".", 1)[-1])
+            for index, ocid in enumerate(
+                self._ocid_values(self._payload_value(payload, field)), start=1
+            ):
+                try:
+                    target = self.shell.browser.resolve_resource_id(target_spec, ocid)
+                except Exception as exc:
+                    self.shell.browser.record_partial_failure(
+                        "declared_relationship", exc
+                    )
+                    continue
+                suffix = f"-{index}" if index > 1 else ""
+                references.append((f"{label}{suffix}", target))
+        return references
+
     def direct(
         self, payload: object, resource: ResourceContext | None = None
     ) -> list[tuple[str, RelationshipTarget]]:
-        references: list[tuple[str, RelationshipTarget]] = []
+        references = self._declared_direct(resource) if resource is not None else []
         for label, ocid in self._payload_ocid_references(payload):
             if self._is_ownership_label(label):
                 continue
