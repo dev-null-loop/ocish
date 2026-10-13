@@ -14,7 +14,7 @@ dependencies = ["oci>=2.184.1", "openai>=2.0", "httpx>=0.28", "oci-genai-auth>=0
 ocish = "main:main"
 
 [tool.setuptools]
-packages = ["ocish"]
+packages = ["ocish", "inventory_adapters"]
 py-modules = [
     "completion",
     "config",
@@ -24,8 +24,7 @@ py-modules = [
     "inventory_registry",
     "inventory_transport",
     "inventory_catalog",
-    "inventory_adapters_object_storage",
-    "inventory_adapters_openai",
+    "inventory_rows",
     "main",
     "models",
     "relationships",
